@@ -1,0 +1,11 @@
+customtkinter>=5.2.0
+matplotlib>=3.7.0
+pandas>=2.0.0
+numpy>=1.24.0
+openpyxl>=3.1.0
+pillow>=10.0.0
+
+# Optional: enables drag-and-drop file loading.
+# The app falls back gracefully (drag-and-drop simply disabled) if this
+# isn't installed, since tkinterdnd2 has no prebuilt wheels on some platforms.
+tkinterdnd2>=0.3.0
