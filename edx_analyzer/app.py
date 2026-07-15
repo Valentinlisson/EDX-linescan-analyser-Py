@@ -6,7 +6,7 @@ import json
 
 import customtkinter as ctk
 import tkinter as tk
-from tkinter import filedialog, messagebox, colorchooser, simpledialog
+from tkinter import filedialog, messagebox, simpledialog
 import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
@@ -19,12 +19,30 @@ from .constants import COLORS_DEFAULT, MARKERS, LEGEND_POSITIONS, BACKGROUND_PRE
 from .color_utils import contrast_text_color
 from .data_processing import parse_edx_file, get_elements, get_pos_col, normalize_to_100
 from .phase_manager import PhaseManagerWindow
+from .widgets import ColorPickerDialog, add_tooltip
+from .history import ChangeHistory
+
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    _DND_AVAILABLE = True
+except ImportError:
+    TkinterDnD, DND_FILES = None, None
+    _DND_AVAILABLE = False
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
+# Drag-and-drop support requires mixing in TkinterDnD's wrapper alongside
+# CTk's root window class; fall back to plain CTk if the optional
+# tkinterdnd2 dependency isn't installed.
+if _DND_AVAILABLE:
+    class _AppBase(ctk.CTk, TkinterDnD.DnDWrapper):
+        pass
+else:
+    _AppBase = ctk.CTk
 
-class EDXApp(ctk.CTk):
+
+class EDXApp(_AppBase):
     def __init__(self):
         super().__init__()
         self.title("EDX Line Scan Viewer - Lab Edition (PDF Reports)")
@@ -56,30 +74,65 @@ class EDXApp(ctk.CTk):
         self._slider_interacting, self._pan_start = False, None
         self.roi_selector = None
 
+        self.appearance_var = ctk.StringVar(value="Dark")
+        self.status_var = tk.StringVar(value="Ready. Load an EDX .txt file to begin.")
+
+        self.change_history = ChangeHistory()
+        self._last_style_snapshot = None
+
         self._build_ui()
+        self._init_style_baseline()
+
+        if _DND_AVAILABLE:
+            self.TkdndVersion = TkinterDnD._require(self)
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind('<<Drop>>', self._on_file_drop)
+
+        self.bind_all("<Control-z>", self._undo)
+        self.bind_all("<Control-y>", self._redo)
+        self.bind_all("<Control-Shift-Z>", self._redo)
 
     # ─────────────────────────────────────────────────────────────────────
     #  Layout
     # ─────────────────────────────────────────────────────────────────────
     def _build_ui(self):
-        self.grid_columnconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=0)
 
-        self.left_panel = ctk.CTkScrollableFrame(self, width=280, corner_radius=0)
-        self.left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        # A resizable PanedWindow so the side panels can be dragged wider/narrower.
+        self.paned = tk.PanedWindow(self, orient="horizontal", sashrelief="raised", sashwidth=6, bg=BG, bd=0)
+        self.paned.grid(row=0, column=0, sticky="nsew")
 
-        center_frame = ctk.CTkFrame(self, fg_color="transparent")
-        center_frame.grid(row=0, column=1, sticky="nsew", padx=5, pady=10)
+        # CTkScrollableFrame renders itself inside an internal canvas, so its
+        # own Tk widget isn't a direct child of the pane — wrap each side in
+        # a plain CTkFrame that the PanedWindow can hold directly.
+        left_wrapper = ctk.CTkFrame(self.paned, fg_color="transparent")
+        self.paned.add(left_wrapper, minsize=220, width=280)
+        self.left_panel = ctk.CTkScrollableFrame(left_wrapper, corner_radius=0)
+        self.left_panel.pack(fill="both", expand=True)
+
+        center_frame = ctk.CTkFrame(self.paned, fg_color="transparent")
+        self.paned.add(center_frame, minsize=400, stretch="always")
 
         graph_inside_frame = ctk.CTkFrame(center_frame)
-        graph_inside_frame.pack(fill="both", expand=True)
+        graph_inside_frame.pack(fill="both", expand=True, padx=5, pady=10)
 
-        self.right_panel = ctk.CTkScrollableFrame(self, width=350, corner_radius=0)
-        self.right_panel.grid(row=0, column=2, sticky="nsew", padx=(5, 0))
+        right_wrapper = ctk.CTkFrame(self.paned, fg_color="transparent")
+        self.paned.add(right_wrapper, minsize=280, width=350)
+        self.right_panel = ctk.CTkScrollableFrame(right_wrapper, corner_radius=0)
+        self.right_panel.pack(fill="both", expand=True)
+
+        self.status_bar = ctk.CTkFrame(self, height=28, corner_radius=0)
+        self.status_bar.grid(row=1, column=0, sticky="ew")
+        ctk.CTkLabel(self.status_bar, textvariable=self.status_var, anchor="w", font=("Arial", 11), text_color="gray70").pack(side="left", padx=10, pady=3)
 
         self._build_left(self.left_panel)
         self._build_graph(graph_inside_frame)
         self._build_right(self.right_panel)
+
+    def _set_status(self, message):
+        self.status_var.set(message)
 
     def _section(self, parent, text):
         ctk.CTkLabel(parent, text=text, font=("Helvetica", 12, "bold"), text_color=ACCENT).pack(anchor="w", pady=(15, 5))
@@ -88,32 +141,67 @@ class EDXApp(ctk.CTk):
         ctk.CTkLabel(p, text="EDX Lab Viewer", font=("Helvetica", 20, "bold")).pack(anchor="w", pady=(5, 10))
 
         self._section(p, "MAIN DATA")
-        ctk.CTkButton(p, text="📂 Load File", command=self._open_file).pack(fill="x", pady=2)
+        load_btn = ctk.CTkButton(p, text="📂 Load File", command=self._open_file)
+        load_btn.pack(fill="x", pady=2)
+        drop_hint = " Drag & drop a .txt file onto the window also works." if _DND_AVAILABLE else ""
+        add_tooltip(load_btn, "Open an EDX line-scan .txt file." + drop_hint)
         ctk.CTkLabel(p, textvariable=self.filepath_var, font=("Helvetica", 11), text_color="gray", wraplength=240).pack(anchor="w")
 
         self._section(p, "DATA PROCESSING")
         row_btn = ctk.CTkFrame(p, fg_color="transparent")
         row_btn.pack(fill="x", pady=5)
-        ctk.CTkButton(row_btn, text="✔ Normalize 100%", command=self._apply_normalization, width=130).pack(side="left", padx=(0, 5))
-        ctk.CTkButton(row_btn, text="⏪ Raw", command=self._reset_to_raw, width=80, fg_color="gray40").pack(side="right")
+        norm_btn = ctk.CTkButton(row_btn, text="✔ Normalize 100%", command=self._apply_normalization, width=130)
+        norm_btn.pack(side="left", padx=(0, 5))
+        add_tooltip(norm_btn, "Rescale the checked elements so they sum to 100% at every point.")
+        raw_btn = ctk.CTkButton(row_btn, text="⏪ Raw", command=self._reset_to_raw, width=80, fg_color="gray40")
+        raw_btn.pack(side="right")
+        add_tooltip(raw_btn, "Discard normalization, go back to raw intensities.")
 
         self._section(p, "SCIENTIFIC ANALYSIS")
         self._slider_generic(p, "Smoothing (Pts):", self.smooth_window, 1, 20)
-        ctk.CTkButton(p, text="📊 Extract Stats (ROI)", command=self._activate_roi, fg_color="#E69F00", text_color="black").pack(fill="x", pady=5)
+        roi_btn = ctk.CTkButton(p, text="📊 Extract Stats (ROI)", command=self._activate_roi, fg_color="#E69F00", text_color="black")
+        roi_btn.pack(fill="x", pady=5)
+        add_tooltip(roi_btn, "Drag a region on the graph to get per-element average/max stats.")
 
-        ctk.CTkButton(p, text="⚙ Phase Editor (JSON)", fg_color="#009E73", hover_color="#007755", command=self._open_phase_editor).pack(fill="x", pady=2)
-        ctk.CTkButton(p, text="📋 Identify Multi-Zones", fg_color="#56B4E9", text_color="black", hover_color="#3399CC", command=self._generate_phase_report).pack(fill="x", pady=2)
-        ctk.CTkButton(p, text="❌ Clear Zones Overlay", fg_color="gray40", hover_color="gray30", command=self._clear_zones).pack(fill="x", pady=2)
+        phase_btn = ctk.CTkButton(p, text="⚙ Phase Editor (JSON)", fg_color="#009E73", hover_color="#007755", command=self._open_phase_editor)
+        phase_btn.pack(fill="x", pady=2)
+        add_tooltip(phase_btn, "Define chemical composition thresholds that identify a phase.")
+        zones_btn = ctk.CTkButton(p, text="📋 Identify Multi-Zones", fg_color="#56B4E9", text_color="black", hover_color="#3399CC", command=self._generate_phase_report)
+        zones_btn.pack(fill="x", pady=2)
+        add_tooltip(zones_btn, "Scan the profile and mark phase boundaries using the presets above.")
+        clear_btn = ctk.CTkButton(p, text="❌ Clear Zones Overlay", fg_color="gray40", hover_color="gray30", command=self._clear_zones)
+        clear_btn.pack(fill="x", pady=2)
+        add_tooltip(clear_btn, "Remove the phase zone markers from the graph.")
 
         self._section(p, "ELEMENTS")
         self.el_frame = ctk.CTkFrame(p, fg_color="transparent")
         self.el_frame.pack(fill="x")
         row_tous = ctk.CTkFrame(p, fg_color="transparent")
         row_tous.pack(fill="x", pady=10)
-        ctk.CTkButton(row_tous, text="✅ All", command=self._show_all, width=100).pack(side="left", expand=True)
-        ctk.CTkButton(row_tous, text="⬜ None", command=self._hide_all, width=100, fg_color="gray40").pack(side="right", expand=True)
+        all_btn = ctk.CTkButton(row_tous, text="✅ All", command=self._show_all, width=100)
+        all_btn.pack(side="left", expand=True)
+        add_tooltip(all_btn, "Show every element's curve.")
+        none_btn = ctk.CTkButton(row_tous, text="⬜ None", command=self._hide_all, width=100, fg_color="gray40")
+        none_btn.pack(side="right", expand=True)
+        add_tooltip(none_btn, "Hide every element's curve.")
 
     def _build_right(self, p):
+        self._section(p, "APPEARANCE")
+        theme_row = ctk.CTkFrame(p, fg_color="transparent")
+        theme_row.pack(fill="x", pady=2)
+        ctk.CTkLabel(theme_row, text="App theme :").pack(side="left")
+        ctk.CTkSegmentedButton(theme_row, values=["Light", "Dark"], variable=self.appearance_var,
+                               command=self._toggle_appearance).pack(side="right")
+
+        history_row = ctk.CTkFrame(p, fg_color="transparent")
+        history_row.pack(fill="x", pady=2)
+        self.undo_btn = ctk.CTkButton(history_row, text="↶ Undo", command=self._undo, state="disabled", width=100)
+        self.undo_btn.pack(side="left", expand=True)
+        add_tooltip(self.undo_btn, "Undo the last style change (Ctrl+Z).")
+        self.redo_btn = ctk.CTkButton(history_row, text="↷ Redo", command=self._redo, state="disabled", width=100, fg_color="gray40")
+        self.redo_btn.pack(side="right", expand=True)
+        add_tooltip(self.redo_btn, "Redo the last undone style change (Ctrl+Y).")
+
         self._section(p, "INTERACTIVE TOOLS")
         ctk.CTkLabel(p, text="Double-click Graph:", text_color="gray", font=("Arial", 10)).pack(anchor="w")
         ctk.CTkLabel(p, text="Top = Title | Bottom/Left = Axes | Center = Reset", text_color="gray", font=("Arial", 10)).pack(anchor="w")
@@ -122,33 +210,50 @@ class EDXApp(ctk.CTk):
         self._section(p, "VISUAL PRESETS")
         row_pre = ctk.CTkFrame(p, fg_color="transparent")
         row_pre.pack(fill="x")
-        ctk.CTkButton(row_pre, text="💾 Save", command=self._save_presets, width=100).pack(side="left", expand=True)
-        ctk.CTkButton(row_pre, text="📂 Load", command=self._load_presets, width=100, fg_color="gray40").pack(side="right", expand=True)
+        save_pre_btn = ctk.CTkButton(row_pre, text="💾 Save", command=self._save_presets, width=100)
+        save_pre_btn.pack(side="left", expand=True)
+        add_tooltip(save_pre_btn, "Save the current colors/markers/backgrounds/legend layout to a JSON file.")
+        load_pre_btn = ctk.CTkButton(row_pre, text="📂 Load", command=self._load_presets, width=100, fg_color="gray40")
+        load_pre_btn.pack(side="right", expand=True)
+        add_tooltip(load_pre_btn, "Load a previously saved visual layout.")
 
         self._section(p, "ZOOM / SCALE")
         self._slider_zoom(p, "Zoom X :", self.scale_x, 1.0, 10.0)
         self._slider_zoom(p, "Zoom Y :", self.scale_y, 1.0, 10.0)
-        ctk.CTkButton(p, text="🔍 Auto-Scale", command=self._autoscale_graph).pack(fill="x", pady=5)
+        autoscale_btn = ctk.CTkButton(p, text="🔍 Auto-Scale", command=self._autoscale_graph)
+        autoscale_btn.pack(fill="x", pady=5)
+        add_tooltip(autoscale_btn, "Reset zoom/pan and fit the whole profile in view.")
 
         self._section(p, "DESIGN & LEGEND")
-        ctk.CTkComboBox(p, variable=self.legend_pos_var, values=list(LEGEND_POSITIONS.keys()), command=lambda v: self._plot()).pack(fill="x", pady=5)
+        ctk.CTkComboBox(p, variable=self.legend_pos_var, values=list(LEGEND_POSITIONS.keys()), command=self._on_legend_change).pack(fill="x", pady=5)
         self._slider_generic(p, "Line Thickness :", self.line_width, 0.5, 5.0)
         self._slider_generic(p, "Point Size :", self.marker_size, 0.0, 20.0)
         self._slider_generic(p, "Font Size :", self.font_size, 7, 18)
-        ctk.CTkCheckBox(p, text="Show Grid", variable=self.show_grid, command=self._plot).pack(anchor="w", pady=5)
+        ctk.CTkCheckBox(p, text="Show Grid", variable=self.show_grid, command=self._on_grid_toggle).pack(anchor="w", pady=5)
 
         self._section(p, "GRAPH BACKGROUND")
         self._build_background_controls(p)
 
         self._section(p, "EXPORTS & REPORTS")
-        ctk.CTkButton(p, text="🖼 Save Image (PNG/SVG...)", command=self._save_fig).pack(fill="x", pady=2)
-        ctk.CTkButton(p, text="📄 Export Data (CSV)", command=self._export_csv).pack(fill="x", pady=2)
-        ctk.CTkButton(p, text="📊 Export Data (Excel)", command=self._export_excel).pack(fill="x", pady=2)
-        ctk.CTkButton(p, text="📑 Generate PDF Report", command=self._export_pdf_report, fg_color="#882255", hover_color="#551133").pack(fill="x", pady=(10, 5))
+        img_btn = ctk.CTkButton(p, text="🖼 Save Image (PNG/SVG...)", command=self._save_fig)
+        img_btn.pack(fill="x", pady=2)
+        add_tooltip(img_btn, "Export the current graph as an image or vector file.")
+        csv_btn = ctk.CTkButton(p, text="📄 Export Data (CSV)", command=self._export_csv)
+        csv_btn.pack(fill="x", pady=2)
+        add_tooltip(csv_btn, "Export the currently displayed (raw or normalized) data as CSV.")
+        xlsx_btn = ctk.CTkButton(p, text="📊 Export Data (Excel)", command=self._export_excel)
+        xlsx_btn.pack(fill="x", pady=2)
+        add_tooltip(xlsx_btn, "Export both raw and processed data as an Excel workbook.")
+        pdf_btn = ctk.CTkButton(p, text="📑 Generate PDF Report", command=self._export_pdf_report, fg_color="#882255", hover_color="#551133")
+        pdf_btn.pack(fill="x", pady=(10, 5))
+        add_tooltip(pdf_btn, "Build a multi-page PDF: parameters, detected zones table, and the graph.")
 
         self._section(p, "ELEMENT CUSTOMIZATION")
         self.custom_frame = ctk.CTkFrame(p, fg_color="transparent")
         self.custom_frame.pack(fill="x")
+
+    def _toggle_appearance(self, value):
+        ctk.set_appearance_mode(value.lower())
 
     def _build_background_controls(self, p):
         """Color pickers + quick presets for the plot area and figure backgrounds."""
@@ -158,6 +263,7 @@ class EDXApp(ctk.CTk):
         self.plot_bg_btn = ctk.CTkButton(row_plot, text="", width=32, height=25, fg_color=self.plot_bg_color.get(), border_width=1, border_color="gray50")
         self.plot_bg_btn.configure(command=lambda: self._pick_bg_color(self.plot_bg_color, self.plot_bg_btn))
         self.plot_bg_btn.pack(side="right")
+        add_tooltip(self.plot_bg_btn, "Background color behind the curves.")
 
         row_fig = ctk.CTkFrame(p, fg_color="transparent")
         row_fig.pack(fill="x", pady=2)
@@ -165,21 +271,27 @@ class EDXApp(ctk.CTk):
         self.fig_bg_btn = ctk.CTkButton(row_fig, text="", width=32, height=25, fg_color=self.fig_bg_color.get(), border_width=1, border_color="gray50")
         self.fig_bg_btn.configure(command=lambda: self._pick_bg_color(self.fig_bg_color, self.fig_bg_btn))
         self.fig_bg_btn.pack(side="right")
+        add_tooltip(self.fig_bg_btn, "Outer figure background (around the plot area, incl. title/labels).")
 
         ctk.CTkLabel(p, text="Quick presets :", text_color="gray", font=("Arial", 10)).pack(anchor="w", pady=(6, 2))
         preset_row = ctk.CTkFrame(p, fg_color="transparent")
         preset_row.pack(fill="x")
         for name, hexcode in BACKGROUND_PRESETS.items():
-            ctk.CTkButton(preset_row, text="", width=22, height=22, fg_color=hexcode, border_width=1,
-                          border_color="gray50", command=lambda h=hexcode: self._apply_bg_preset(h)).pack(side="left", padx=2)
+            preset_btn = ctk.CTkButton(preset_row, text="", width=22, height=22, fg_color=hexcode, border_width=1,
+                                       border_color="gray50", command=lambda h=hexcode: self._apply_bg_preset(h))
+            preset_btn.pack(side="left", padx=2)
+            add_tooltip(preset_btn, name)
 
-        ctk.CTkButton(p, text="↺ Reset Backgrounds", fg_color="gray40", command=self._reset_backgrounds).pack(fill="x", pady=(6, 2))
+        reset_bg_btn = ctk.CTkButton(p, text="↺ Reset Backgrounds", fg_color="gray40", command=self._reset_backgrounds)
+        reset_bg_btn.pack(fill="x", pady=(6, 2))
+        add_tooltip(reset_bg_btn, "Restore the default dark backgrounds.")
 
     def _pick_bg_color(self, str_var, btn_widget):
-        color = colorchooser.askcolor(color=str_var.get(), title="Select Background Color")
-        if color[1]:
-            str_var.set(color[1])
-            btn_widget.configure(fg_color=color[1])
+        color = ColorPickerDialog.ask_color(self, initial_color=str_var.get(), title="Select Background Color")
+        if color:
+            str_var.set(color)
+            btn_widget.configure(fg_color=color)
+            self._record_style_change()
             self._plot()
 
     def _apply_bg_preset(self, hexcode):
@@ -188,6 +300,7 @@ class EDXApp(ctk.CTk):
         self.fig_bg_color.set(hexcode)
         self.plot_bg_btn.configure(fg_color=hexcode)
         self.fig_bg_btn.configure(fg_color=hexcode)
+        self._record_style_change()
         self._plot()
 
     def _reset_backgrounds(self):
@@ -195,6 +308,19 @@ class EDXApp(ctk.CTk):
         self.fig_bg_color.set("#1E2127")
         self.plot_bg_btn.configure(fg_color="#282C34")
         self.fig_bg_btn.configure(fg_color="#1E2127")
+        self._record_style_change()
+        self._plot()
+
+    def _on_legend_change(self, value):
+        self._record_style_change()
+        self._plot()
+
+    def _on_grid_toggle(self):
+        self._record_style_change()
+        self._plot()
+
+    def _on_marker_change(self, value):
+        self._record_style_change()
         self._plot()
 
     def _slider_zoom(self, parent, label, var, from_, to):
@@ -225,11 +351,12 @@ class EDXApp(ctk.CTk):
 
         ctk.CTkSlider(parent, from_=from_, to=to, variable=var, number_of_steps=int(to - from_) if isinstance(var, ctk.IntVar) else None, command=_upd).pack(fill="x")
 
-    def _pick_color(self, str_var, btn_widget):
-        color = colorchooser.askcolor(color=str_var.get(), title="Select Color")
-        if color[1]:
-            str_var.set(color[1])
-            btn_widget.configure(fg_color=color[1])
+    def _pick_element_color(self, el, btn_widget):
+        color = ColorPickerDialog.ask_color(self, initial_color=self.el_colors.get(el, "#FFFFFF"), title=f"Select Color — {el}")
+        if color:
+            self.el_colors[el] = color
+            btn_widget.configure(fg_color=color)
+            self._record_style_change()
             self._plot()
 
     def _save_presets(self):
@@ -267,6 +394,8 @@ class EDXApp(ctk.CTk):
                         self.el_markers[k].set(v)
             self._build_element_rows()
             self._plot()
+            self._init_style_baseline()
+            self._set_status(f"Visual layout loaded from {os.path.basename(p)}.")
         except Exception:
             messagebox.showerror("Error", "File corrupted or invalid layout.")
 
@@ -313,10 +442,11 @@ class EDXApp(ctk.CTk):
             ctk.CTkLabel(r, text=el, width=30).pack(side="left")
 
             btn = ctk.CTkButton(r, text="", width=25, height=25, fg_color=self.el_colors[el])
-            btn.configure(command=lambda e=el, b=btn: self._pick_color(tk.StringVar(value=self.el_colors[e]), b) or self.el_colors.update({e: b.cget("fg_color")}) or self._plot())
+            btn.configure(command=lambda e=el, b=btn: self._pick_element_color(e, b))
             btn.pack(side="left", padx=5)
+            add_tooltip(btn, f"Line color for {el}.")
 
-            cb = ctk.CTkComboBox(r, variable=self.el_markers[el], values=list(MARKERS.keys()), width=100, command=lambda v: self._plot())
+            cb = ctk.CTkComboBox(r, variable=self.el_markers[el], values=list(MARKERS.keys()), width=100, command=self._on_marker_change)
             cb.pack(side="right", padx=5)
 
     def _show_all(self):
@@ -326,6 +456,76 @@ class EDXApp(ctk.CTk):
     def _hide_all(self):
         [v.set(False) for v in self.el_vars.values()]
         self._plot()
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Style Undo / Redo
+    #  Scope is intentionally limited to discrete, easy-to-mistake actions:
+    #  colors, markers, legend position and grid. Continuous sliders (line
+    #  width, point size, font size, zoom) are excluded so that an undo
+    #  doesn't silently revert an unrelated in-progress drag.
+    # ─────────────────────────────────────────────────────────────────────
+    def _capture_style_state(self):
+        return {
+            "plot_bg": self.plot_bg_color.get(),
+            "fig_bg": self.fig_bg_color.get(),
+            "legend": self.legend_pos_var.get(),
+            "grid": self.show_grid.get(),
+            "colors": dict(self.el_colors),
+            "markers": {k: v.get() for k, v in self.el_markers.items()},
+        }
+
+    def _restore_style_state(self, state):
+        self.plot_bg_color.set(state["plot_bg"])
+        self.fig_bg_color.set(state["fig_bg"])
+        self.plot_bg_btn.configure(fg_color=state["plot_bg"])
+        self.fig_bg_btn.configure(fg_color=state["fig_bg"])
+        self.legend_pos_var.set(state["legend"])
+        self.show_grid.set(state["grid"])
+        self.el_colors.clear()
+        self.el_colors.update(state["colors"])
+        for k, v in state["markers"].items():
+            if k in self.el_markers:
+                self.el_markers[k].set(v)
+        self._build_element_rows()
+        self._plot()
+
+    def _init_style_baseline(self):
+        self._last_style_snapshot = self._capture_style_state()
+        self.change_history.reset()
+        self._update_undo_redo_buttons()
+
+    def _record_style_change(self):
+        """Call AFTER a discrete style mutation has already been applied."""
+        if self._last_style_snapshot is None:
+            self._last_style_snapshot = self._capture_style_state()
+            return
+        self.change_history.push(self._last_style_snapshot)
+        self._last_style_snapshot = self._capture_style_state()
+        self._update_undo_redo_buttons()
+
+    def _undo(self, event=None):
+        new_state = self.change_history.undo(self._last_style_snapshot)
+        if new_state is None:
+            return
+        self._restore_style_state(new_state)
+        self._last_style_snapshot = new_state
+        self._update_undo_redo_buttons()
+        self._set_status("Undid last style change.")
+
+    def _redo(self, event=None):
+        new_state = self.change_history.redo(self._last_style_snapshot)
+        if new_state is None:
+            return
+        self._restore_style_state(new_state)
+        self._last_style_snapshot = new_state
+        self._update_undo_redo_buttons()
+        self._set_status("Redid style change.")
+
+    def _update_undo_redo_buttons(self):
+        if hasattr(self, "undo_btn"):
+            self.undo_btn.configure(state="normal" if self.change_history.can_undo else "disabled")
+        if hasattr(self, "redo_btn"):
+            self.redo_btn.configure(state="normal" if self.change_history.can_redo else "disabled")
 
     def _style_axes(self):
         self.ax.set_facecolor(self.plot_bg_color.get())
@@ -353,14 +553,33 @@ class EDXApp(ctk.CTk):
             self.ax.grid(False)
 
     def _open_file(self):
-        p = filedialog.askopenfilename()
+        p = filedialog.askopenfilename(filetypes=[("Text File", "*.txt"), ("All Files", "*.*")])
         if p:
-            self.df_raw = parse_edx_file(p)
-            self.elements = get_elements(self.df_raw)
-            self.df_norm = self.df_raw.copy()
-            self.filepath_var.set(os.path.basename(p))
-            self._build_element_rows()
-            self._autoscale_graph()
+            self._load_edx_file(p)
+
+    def _on_file_drop(self, event):
+        paths = self.tk.splitlist(event.data)
+        if not paths:
+            return
+        self._load_edx_file(paths[0])
+
+    def _load_edx_file(self, path):
+        try:
+            df_raw = parse_edx_file(path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load EDX file:\n{e}")
+            self._set_status(f"Failed to load {os.path.basename(path)}.")
+            return
+        self.df_raw = df_raw
+        self.elements = get_elements(self.df_raw)
+        self.df_norm = self.df_raw.copy()
+        self.is_normalized = False
+        self.detected_zones = []
+        self.filepath_var.set(os.path.basename(path))
+        self._build_element_rows()
+        self._autoscale_graph()
+        self._init_style_baseline()
+        self._set_status(f"Loaded {os.path.basename(path)} — {len(self.df_raw)} points, {len(self.elements)} elements.")
 
     def _apply_normalization(self):
         if self.df_raw is None:
@@ -369,6 +588,7 @@ class EDXApp(ctk.CTk):
         self.df_norm = normalize_to_100(self.df_raw, self.elements, act)
         self.is_normalized = True
         self._autoscale_graph()
+        self._set_status("Data normalized to 100%.")
 
     def _reset_to_raw(self):
         if self.df_raw is None:
@@ -376,6 +596,7 @@ class EDXApp(ctk.CTk):
         self.df_norm = self.df_raw.copy()
         self.is_normalized = False
         self._autoscale_graph()
+        self._set_status("Back to raw intensities.")
 
     def _autoscale_graph(self):
         if self.df_norm is None:
@@ -451,6 +672,7 @@ class EDXApp(ctk.CTk):
 
         # Redraw the plot to show the vertical lines and titles safely
         self._plot()
+        self._set_status(f"Identified {len(self.detected_zones)} zone(s).")
 
         # Show quick textual summary
         report_lines = [f" ◼ [{z['start']:.2f} to {z['end']:.2f} µm]  ➡  {z['name']}" for z in self.detected_zones]
@@ -524,8 +746,10 @@ class EDXApp(ctk.CTk):
                 self._style_axes()
                 self._plot()
 
+            self._set_status(f"PDF report saved to {os.path.basename(path)}.")
             messagebox.showinfo("Success", "Comprehensive PDF Report successfully exported.")
         except Exception as e:
+            self._set_status("PDF export failed.")
             messagebox.showerror("Export Error", f"Failed to build PDF:\n{str(e)}")
 
     def _save_fig(self):
@@ -534,7 +758,7 @@ class EDXApp(ctk.CTk):
         p = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG Image", "*.png"), ("SVG Vector", "*.svg"), ("PDF Plot Only", "*.pdf")])
         if p:
             self.fig.savefig(p, dpi=300, bbox_inches="tight", facecolor=self.fig_bg_color.get())
-            messagebox.showinfo("Success", "Image saved.")
+            self._set_status(f"Image saved to {os.path.basename(p)}.")
 
     def _export_csv(self):
         if self.df_norm is None:
@@ -542,7 +766,7 @@ class EDXApp(ctk.CTk):
         p = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
         if p:
             self.df_norm.to_csv(p, index=False, sep=";", float_format="%.4f")
-            messagebox.showinfo("Success", "Data exported to CSV.")
+            self._set_status(f"Data exported to {os.path.basename(p)}.")
 
     def _export_excel(self):
         if self.df_norm is None:
@@ -553,7 +777,7 @@ class EDXApp(ctk.CTk):
                 with pd.ExcelWriter(p, engine="openpyxl") as w:
                     self.df_norm.to_excel(w, sheet_name="Processed", index=False)
                     self.df_raw.to_excel(w, sheet_name="Raw", index=False)
-                messagebox.showinfo("Success", "Data exported to Excel.")
+                self._set_status(f"Data exported to {os.path.basename(p)}.")
             except Exception as e:
                 messagebox.showerror("Error", str(e))
 

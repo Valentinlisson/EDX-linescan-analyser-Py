@@ -121,12 +121,17 @@ class PhaseManagerWindow(ctk.CTkToplevel):
                     try:
                         lims["min"] = float(min_v)
                     except ValueError:
-                        pass
+                        messagebox.showerror("Error", f"Invalid Min value for {el}: '{min_v}' is not a number.")
+                        return
                 if max_v:
                     try:
                         lims["max"] = float(max_v)
                     except ValueError:
-                        pass
+                        messagebox.showerror("Error", f"Invalid Max value for {el}: '{max_v}' is not a number.")
+                        return
+                if "min" in lims and "max" in lims and lims["min"] > lims["max"]:
+                    messagebox.showerror("Error", f"For {el}: Min ({lims['min']}%) cannot be greater than Max ({lims['max']}%).")
+                    return
                 if lims:
                     conditions[el] = lims
 
