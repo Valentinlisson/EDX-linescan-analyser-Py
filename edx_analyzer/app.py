@@ -10,7 +10,6 @@ from tkinter import filedialog, messagebox, simpledialog
 import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
 import matplotlib.ticker as ticker
 from matplotlib.widgets import SpanSelector
@@ -19,8 +18,11 @@ from .constants import COLORS_DEFAULT, MARKERS, LEGEND_POSITIONS, BACKGROUND_PRE
 from .color_utils import contrast_text_color
 from .data_processing import parse_edx_file, get_elements, get_pos_col, normalize_to_100
 from .phase_manager import PhaseManagerWindow
+from .manual_zones import ManualZoneDialog, ManualZoneManagerWindow
 from .widgets import ColorPickerDialog, add_tooltip
 from .history import ChangeHistory
+from .image_measurement import ImageMeasurementMixin
+from .report import ReportInfoDialog, generate_pdf_report
 
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -42,7 +44,7 @@ else:
     _AppBase = ctk.CTk
 
 
-class EDXApp(_AppBase):
+class EDXApp(_AppBase, ImageMeasurementMixin):
     def __init__(self):
         super().__init__()
         self.title("EDX Line Scan Viewer - Lab Edition (PDF Reports)")
@@ -52,7 +54,8 @@ class EDXApp(_AppBase):
         self.elements = []
         self.is_normalized = False
         self.phase_presets = []
-        self.detected_zones = []  # Stores the computed zones drawn on the graph
+        self.detected_zones = []  # Auto-detected zones (from the phase presets)
+        self.manual_zones = []  # User-defined zones (drag + precise numeric edit)
 
         self.filepath_var = tk.StringVar(value="No file loaded")
         self.enable_crosshair = ctk.BooleanVar(value=False)
@@ -80,6 +83,8 @@ class EDXApp(_AppBase):
         self.change_history = ChangeHistory()
         self._last_style_snapshot = None
 
+        self._init_image_state()
+
         self._build_ui()
         self._init_style_baseline()
 
@@ -100,8 +105,27 @@ class EDXApp(_AppBase):
         self.grid_rowconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=0)
 
+        self.tabview = ctk.CTkTabview(self, corner_radius=0)
+        self.tabview.grid(row=0, column=0, sticky="nsew")
+        edx_tab = self.tabview.add("EDX Analysis")
+        image_tab = self.tabview.add("SEM Image & Measurements")
+
+        self._build_edx_tab(edx_tab)
+        self._build_image_tab(image_tab)
+        # A tab built while hidden gets a matplotlib canvas sized 0x0; force a
+        # redraw once it's actually shown so the figure renders at real size.
+        self.tabview.configure(command=self._on_tab_changed)
+
+        self.status_bar = ctk.CTkFrame(self, height=28, corner_radius=0)
+        self.status_bar.grid(row=1, column=0, sticky="ew")
+        ctk.CTkLabel(self.status_bar, textvariable=self.status_var, anchor="w", font=("Arial", 11), text_color="gray70").pack(side="left", padx=10, pady=3)
+
+    def _build_edx_tab(self, tab):
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+
         # A resizable PanedWindow so the side panels can be dragged wider/narrower.
-        self.paned = tk.PanedWindow(self, orient="horizontal", sashrelief="raised", sashwidth=6, bg=BG, bd=0)
+        self.paned = tk.PanedWindow(tab, orient="horizontal", sashrelief="raised", sashwidth=6, bg=BG, bd=0)
         self.paned.grid(row=0, column=0, sticky="nsew")
 
         # CTkScrollableFrame renders itself inside an internal canvas, so its
@@ -123,16 +147,22 @@ class EDXApp(_AppBase):
         self.right_panel = ctk.CTkScrollableFrame(right_wrapper, corner_radius=0)
         self.right_panel.pack(fill="both", expand=True)
 
-        self.status_bar = ctk.CTkFrame(self, height=28, corner_radius=0)
-        self.status_bar.grid(row=1, column=0, sticky="ew")
-        ctk.CTkLabel(self.status_bar, textvariable=self.status_var, anchor="w", font=("Arial", 11), text_color="gray70").pack(side="left", padx=10, pady=3)
-
         self._build_left(self.left_panel)
         self._build_graph(graph_inside_frame)
         self._build_right(self.right_panel)
 
     def _set_status(self, message):
         self.status_var.set(message)
+
+    def _on_tab_changed(self):
+        # A tab's matplotlib canvas / CTkScrollableFrame can be laid out at
+        # 0x0 while hidden; force a layout pass before redrawing so the
+        # first switch doesn't show a stale/blank frame.
+        self.update_idletasks()
+        if self.tabview.get() == "SEM Image & Measurements":
+            self._redraw_image()
+        elif self.df_norm is not None:
+            self._plot()
 
     def _section(self, parent, text):
         ctk.CTkLabel(parent, text=text, font=("Helvetica", 12, "bold"), text_color=ACCENT).pack(anchor="w", pady=(15, 5))
@@ -169,9 +199,21 @@ class EDXApp(_AppBase):
         zones_btn = ctk.CTkButton(p, text="📋 Identify Multi-Zones", fg_color="#56B4E9", text_color="black", hover_color="#3399CC", command=self._generate_phase_report)
         zones_btn.pack(fill="x", pady=2)
         add_tooltip(zones_btn, "Scan the profile and mark phase boundaries using the presets above.")
-        clear_btn = ctk.CTkButton(p, text="❌ Clear Zones Overlay", fg_color="gray40", hover_color="gray30", command=self._clear_zones)
+        clear_btn = ctk.CTkButton(p, text="❌ Clear Auto Zones", fg_color="gray40", hover_color="gray30", command=self._clear_auto_zones)
         clear_btn.pack(fill="x", pady=2)
-        add_tooltip(clear_btn, "Remove the phase zone markers from the graph.")
+        add_tooltip(clear_btn, "Remove the auto-detected zone markers from the graph.")
+
+        self._section(p, "MANUAL ZONES")
+        ctk.CTkLabel(p, text="For noisy data where auto-detection struggles.", text_color="gray", font=("Arial", 10), wraplength=240, justify="left").pack(anchor="w")
+        add_zone_btn = ctk.CTkButton(p, text="📐 Add Manual Zone", fg_color="#CC79A7", text_color="black", hover_color="#A5628A", command=self._activate_manual_zone_tool)
+        add_zone_btn.pack(fill="x", pady=(5, 2))
+        add_tooltip(add_zone_btn, "Drag on the graph to place a zone, then name it and fine-tune its exact bounds.")
+        manage_zone_btn = ctk.CTkButton(p, text="📝 Manage Manual Zones", fg_color="gray35", command=self._open_manual_zone_manager)
+        manage_zone_btn.pack(fill="x", pady=2)
+        add_tooltip(manage_zone_btn, "Review, edit or delete the manual zones you've placed.")
+        clear_manual_btn = ctk.CTkButton(p, text="❌ Clear Manual Zones", fg_color="gray40", hover_color="gray30", command=self._clear_manual_zones)
+        clear_manual_btn.pack(fill="x", pady=2)
+        add_tooltip(clear_manual_btn, "Remove all manual zone markers from the graph.")
 
         self._section(p, "ELEMENTS")
         self.el_frame = ctk.CTkFrame(p, fg_color="transparent")
@@ -575,6 +617,7 @@ class EDXApp(_AppBase):
         self.df_norm = self.df_raw.copy()
         self.is_normalized = False
         self.detected_zones = []
+        self.manual_zones = []
         self.filepath_var.set(os.path.basename(path))
         self._build_element_rows()
         self._autoscale_graph()
@@ -687,70 +730,62 @@ class EDXApp(_AppBase):
         txt_box.insert("1.0", f"File: {self.filepath_var.get()}\n" + "=" * 40 + "\n\n" + "\n".join(report_lines))
         txt_box.configure(state="disabled")
 
-    def _clear_zones(self):
+    def _clear_auto_zones(self):
         self.detected_zones = []
         self._plot()
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Manual Zones
+    # ─────────────────────────────────────────────────────────────────────
+    def _activate_manual_zone_tool(self):
+        if self.df_norm is None:
+            messagebox.showwarning("File Missing", "Please load an EDX working file first.")
+            return
+        messagebox.showinfo("Manual Zone", "Drag on the graph to select the approximate zone extent — you'll be able to fine-tune the exact bounds next.")
+
+        def onselect(xmin, xmax):
+            ManualZoneDialog(self, xmin, xmax, on_confirm=self._add_manual_zone)
+
+        self._set_span_selector(onselect)
+
+    def _add_manual_zone(self, zone):
+        self.manual_zones.append(zone)
+        self._plot()
+        self._set_status(f"Manual zone '{zone['name']}' added.")
+
+    def _open_manual_zone_manager(self):
+        if not self.manual_zones:
+            messagebox.showinfo("No Zones", "No manual zones yet. Use 'Add Manual Zone' first.")
+            return
+        ManualZoneManagerWindow(self, self.manual_zones, self._callback_update_manual_zones)
+
+    def _callback_update_manual_zones(self, updated_zones):
+        self.manual_zones = updated_zones
+        self._plot()
+        self._set_status(f"Manual zones updated ({len(self.manual_zones)}).")
+
+    def _clear_manual_zones(self):
+        self.manual_zones = []
+        self._plot()
+        self._set_status("Manual zones cleared.")
 
     def _export_pdf_report(self):
         if self.df_norm is None:
             return
-        path = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF Report", "*.pdf")])
-        if not path:
-            return
 
-        try:
-            with PdfPages(path) as pdf:
-                # Page 1: Parameters and Zones Table
-                fig_text = Figure(figsize=(8.5, 11))
-                ax_text = fig_text.add_subplot(111)
-                ax_text.axis('off')
+        def on_confirm(meta):
+            path = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF Report", "*.pdf")])
+            if not path:
+                return
+            try:
+                generate_pdf_report(self, path, meta)
+                self._set_status(f"PDF report saved to {os.path.basename(path)}.")
+                messagebox.showinfo("Success", "Comprehensive PDF Report successfully exported.")
+            except Exception as e:
+                self._set_status("PDF export failed.")
+                messagebox.showerror("Export Error", f"Failed to build PDF:\n{str(e)}")
 
-                content = "EDX Structural Analysis Report\n"
-                content += "=" * 50 + "\n\n"
-                content += f"File Analyzed: {self.filepath_var.get()}\n"
-                content += f"Data Mode: {'100% Normalized' if self.is_normalized else 'Raw Intensity'}\n"
-                content += f"Smoothing Applied: {self.smooth_window.get()} points\n\n"
-
-                content += "Detected Zones & Phases Summary:\n"
-                content += "-" * 50 + "\n"
-                if self.detected_zones:
-                    for z in self.detected_zones:
-                        content += f"Start: {z['start']:.2f} µm | End: {z['end']:.2f} µm | Phase: {z['name']}\n"
-                else:
-                    content += "No multi-zones mapped. Run 'Identify Multi-Zones' first.\n"
-
-                ax_text.text(0.05, 0.95, content, transform=ax_text.transAxes, fontsize=11, va='top', fontfamily='monospace')
-                pdf.savefig(fig_text)
-
-                # Page 2: The current graphical plot
-                # Temporary adjust layout specifically for PDF sizing if needed
-                self.fig.patch.set_facecolor("white")
-                self.ax.set_facecolor("white")
-                self.ax.tick_params(colors="black")
-                for s in self.ax.spines.values():
-                    s.set_edgecolor("black")
-                self.ax.xaxis.label.set_color("black")
-                self.ax.yaxis.label.set_color("black")
-                self.ax.title.set_color("black")
-                if any(v.get() for v in self.el_vars.values()):
-                    pos = LEGEND_POSITIONS.get(self.legend_pos_var.get(), "outside right")
-                    args = {"frameon": True, "facecolor": "white", "labelcolor": "black"}
-                    if pos == "outside right":
-                        self.ax.legend(**args, loc="upper left", bbox_to_anchor=(1.02, 1))
-                    else:
-                        self.ax.legend(**args, loc=pos)
-
-                pdf.savefig(self.fig, bbox_inches="tight")
-
-                # Restore UI dark theme colors
-                self._style_axes()
-                self._plot()
-
-            self._set_status(f"PDF report saved to {os.path.basename(path)}.")
-            messagebox.showinfo("Success", "Comprehensive PDF Report successfully exported.")
-        except Exception as e:
-            self._set_status("PDF export failed.")
-            messagebox.showerror("Export Error", f"Failed to build PDF:\n{str(e)}")
+        ReportInfoDialog(self, on_confirm, has_image=(self.sem_image_array is not None))
 
     def _save_fig(self):
         if self.df_norm is None:
@@ -810,6 +845,19 @@ class EDXApp(_AppBase):
                              bbox=dict(facecolor=self.plot_bg_color.get(), edgecolor='none', alpha=0.7),
                              clip_on=False, zorder=5)
 
+        # Manual zones use a shaded span + in-plot rotated label so they stay
+        # visually distinct from the auto-detected zones' floating labels.
+        if self.manual_zones:
+            for zone in self.manual_zones:
+                zcolor = zone.get("color", "#CC79A7")
+                self.ax.axvspan(zone["start"], zone["end"], color=zcolor, alpha=0.12, zorder=0)
+                self.ax.axvline(x=zone["start"], color=zcolor, linestyle="-", linewidth=1.3, zorder=2)
+                self.ax.axvline(x=zone["end"], color=zcolor, linestyle="-", linewidth=1.3, zorder=2)
+                mid_x = (zone["start"] + zone["end"]) / 2
+                self.ax.text(mid_x, 0.96, zone["name"], transform=self.ax.get_xaxis_transform(),
+                             ha="center", va="top", rotation=90, fontsize=max(8, fs - 1), color=zcolor,
+                             fontweight="bold", clip_on=True, zorder=6)
+
         for el in self.elements:
             if not self.el_vars.get(el, ctk.BooleanVar(value=True)).get():
                 continue
@@ -844,12 +892,24 @@ class EDXApp(_AppBase):
         self.canvas.draw()
 
     # --- ROI and Events ---
+    def _set_span_selector(self, onselect):
+        """(Re)activate the graph's drag-select tool. Only one drag tool
+        (ROI stats vs. manual zone placement) can usefully be active at a
+        time, so any previous selector is disconnected first."""
+        if self.roi_selector is not None:
+            try:
+                self.roi_selector.disconnect_events()
+            except Exception:
+                pass
+        self.roi_selector = SpanSelector(self.ax, onselect, 'horizontal', useblit=True, props=dict(alpha=0.3, facecolor=ACCENT))
+
     def _activate_roi(self):
+        if self.df_norm is None:
+            messagebox.showwarning("File Missing", "Please load an EDX working file first.")
+            return
         messagebox.showinfo("Mode ROI", "Drag on the graph to select an X region.")
 
         def onselect(xmin, xmax):
-            if self.df_norm is None:
-                return
             pos_col = get_pos_col(self.df_norm)
             mask = (self.df_norm[pos_col] >= xmin) & (self.df_norm[pos_col] <= xmax)
             sub = self.df_norm[mask]
@@ -859,7 +919,7 @@ class EDXApp(_AppBase):
                     stats += f"• {el}: Avg={sub[el].mean():.2f} | Max={sub[el].max():.2f}\n"
             messagebox.showinfo("ROI Stats", stats)
 
-        self.roi_selector = SpanSelector(self.ax, onselect, 'horizontal', useblit=True, props=dict(alpha=0.3, facecolor=ACCENT))
+        self._set_span_selector(onselect)
 
     def _on_mpl_motion(self, event):
         if self._pan_start and event.x and event.y:
