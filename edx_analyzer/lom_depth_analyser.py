@@ -1,5 +1,5 @@
 """
-LOM Depth Analyser  --  GUI window (add-on for the EDX Line Scan Viewer)
+LOM Depth Analyser  --  "LOM Depth Analyser" module of the analysis suite
 -------------------------------------------------------------------------
 Loads one or several LOM measurement CSV files ("No.";"Measure";"Result";"Unit"),
 sorts / filters the depth values, computes the statistics (min, max, mean,
@@ -13,15 +13,17 @@ groups can be plotted on the same graph (e.g. 3 files for experiment A and
 Everything can be exported: data (CSV / Excel), graph (PNG / SVG / PDF) and a
 complete PDF report.
 
-This file is a stand-alone add-on: it never modifies the original viewer logic.
-It can also be launched alone:      python lom_depth_analyser.py
+The UI is packaged as `LOMDepthAnalyserPanel`, a plain CTkFrame, so it can be
+embedded in the suite's tab bar next to the EDX and SEM modules.
+`LOMDepthAnalyserWindow` wraps the very same panel in its own window, and the
+module stays runnable alone:   python -m edx_analyzer.lom_depth_analyser
 """
 
 import os
 
 import customtkinter as ctk
 import tkinter as tk
-from tkinter import filedialog, messagebox, colorchooser, simpledialog
+from tkinter import filedialog, messagebox, simpledialog
 
 import numpy as np
 import pandas as pd
@@ -29,7 +31,10 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
 
-from lom_depth_core import (
+from .constants import COLORS_DEFAULT, BACKGROUND_PRESETS, LEGEND_POSITIONS, ACCENT
+from .color_utils import contrast_text_color
+from .widgets import ColorPickerDialog, add_tooltip
+from .lom_depth_core import (
     DepthGroup,
     LomParseError,
     bin_centers,
@@ -44,30 +49,25 @@ from lom_depth_core import (
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Look & feel (kept identical to the main EDX viewer)
+#  Look & feel (shared with the rest of the suite, see constants.py)
 # ─────────────────────────────────────────────────────────────────────────────
-BG, ACCENT = "#1E2127", "#61AFEF"
-PLOT_BG = "#282C34"
-GROUP_COLORS = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#D55E00",
-                "#56B4E9", "#F0E442", "#FF0000", "#882255", "#117733"]
+PLOT_BG = BACKGROUND_PRESETS["Dark (default)"]
+GROUP_COLORS = COLORS_DEFAULT
 
 Y_MODES = {"Count (occurrences)": "count", "Percentage (%)": "percent", "Density": "density"}
 CURVE_STYLES = ["Bars", "Line", "Bars + Line", "Step"]
 MAX_BINS = 5000                      # safety limit for a very small grouping factor
 ORIGIN_MODES = ["Auto (min of data)", "Zero", "Custom"]
-LEGEND_POSITIONS = {"Outside Right": "outside right", "Inside Top Right": "upper right",
-                    "Inside Top Left": "upper left", "Inside Bottom Right": "lower right",
-                    "None": "none"}
+# Same placements as the EDX module, plus a "no legend" choice for this graph.
+LOM_LEGEND_POSITIONS = dict(LEGEND_POSITIONS, **{"None": "none"})
 
 
-class LOMDepthAnalyserWindow(ctk.CTkToplevel):
-    """Independent analysis window ('LOM depth analyser')."""
+class LOMDepthAnalyserPanel(ctk.CTkFrame):
+    """The whole 'LOM Depth Analyser' module, as an embeddable frame."""
 
-    def __init__(self, master=None):
-        super().__init__(master)
-        self.title("LOM Depth Analyser — depth distribution & statistics")
-        self.geometry("1650x920")
-        self.minsize(1150, 700)
+    def __init__(self, master, status_callback=None, **kwargs):
+        super().__init__(master, fg_color="transparent", **kwargs)
+        self._status = status_callback if callable(status_callback) else (lambda _m: None)
 
         # ---- data ------------------------------------------------------
         self.groups = []                 # list[DepthGroup]
@@ -99,17 +99,18 @@ class LOMDepthAnalyserWindow(ctk.CTkToplevel):
         self.show_markers = ctk.BooleanVar(value=False)
         self.legend_pos_var = tk.StringVar(value="Outside Right")
         self.light_export = ctk.BooleanVar(value=True)
+        self.plot_bg_color = tk.StringVar(value=PLOT_BG)
+        self.fig_bg_color = tk.StringVar(value=BACKGROUND_PRESETS["Figure Dark"])
+        self.bg_preset_var = tk.StringVar(value="Dark (default)")
 
         self._build_ui()
         self._refresh_all()
 
-        if master is not None:
-            try:
-                if master.winfo_viewable():
-                    self.transient(master)
-            except Exception:                             # noqa: BLE001
-                pass
-        self.after(200, self.lift)
+    def on_shown(self):
+        """Called when the module becomes visible: a matplotlib canvas built
+        inside a hidden tab is laid out 0x0, so force a real redraw."""
+        self.update_idletasks()
+        self._plot()
 
     # ─────────────────────────────────────────────────────────────────────
     #  UI construction
@@ -145,8 +146,10 @@ class LOMDepthAnalyserWindow(ctk.CTkToplevel):
                      font=("Helvetica", 11), text_color="gray").pack(anchor="w")
 
         self._section(p, "GROUPS / EXPERIMENTS")
-        ctk.CTkButton(p, text="➕ New group (load CSV files)",
-                      command=self._new_group).pack(fill="x", pady=2)
+        btn_new = ctk.CTkButton(p, text="➕ New group (load CSV files)", command=self._new_group)
+        btn_new.pack(fill="x", pady=2)
+        add_tooltip(btn_new, "One group = one experiment.\nSelect every CSV file of that "
+                             "experiment at once;\nthey are pooled into a single curve.")
         row = ctk.CTkFrame(p, fg_color="transparent")
         row.pack(fill="x", pady=2)
         ctk.CTkButton(row, text="🎨 Auto colors", width=120, fg_color="gray40",
@@ -171,6 +174,8 @@ class LOMDepthAnalyserWindow(ctk.CTkToplevel):
         ctk.CTkLabel(f, text="Min :", width=40).pack(side="left")
         e_min = ctk.CTkEntry(f, textvariable=self.min_var, width=80, placeholder_text="none")
         e_min.pack(side="left", padx=(0, 10))
+        add_tooltip(e_min, "Values strictly below this limit are excluded\n"
+                           "(useful to drop near-zero measurement noise).")
         ctk.CTkLabel(f, text="Max :", width=40).pack(side="left")
         e_max = ctk.CTkEntry(f, textvariable=self.max_var, width=80, placeholder_text="none")
         e_max.pack(side="left")
@@ -193,6 +198,8 @@ class LOMDepthAnalyserWindow(ctk.CTkToplevel):
         e_bin = ctk.CTkEntry(f2, textvariable=self.bin_width_var, width=70)
         e_bin.pack(side="right")
         e_bin.bind("<Return>", lambda _e: self._refresh_all())
+        add_tooltip(e_bin, "Width of one column of the distribution.\nClose depths fall in the "
+                           "same column\n(0.05 groups 5.54 and 5.55 together).")
         ctk.CTkLabel(p, text="e.g. 0.05 → 5.54 and 5.55 fall in the same column",
                      font=("Helvetica", 11), text_color="gray", wraplength=300).pack(anchor="w")
         ctk.CTkButton(p, text="🎯 Suggest bin width", fg_color="gray40",
@@ -203,6 +210,8 @@ class LOMDepthAnalyserWindow(ctk.CTkToplevel):
         ctk.CTkLabel(f3, text="Bins aligned on :").pack(side="left")
         self.origin_entry = ctk.CTkEntry(f3, textvariable=self.origin_value_var, width=70)
         self.origin_entry.pack(side="right")
+        add_tooltip(self.origin_entry, "Reference value the column grid starts from\n"
+                                       "(used when 'Custom' is selected).")
         self.origin_entry.bind("<Return>", lambda _e: self._refresh_all())
         ctk.CTkComboBox(p, variable=self.origin_mode_var, values=ORIGIN_MODES,
                         command=lambda _v: self._refresh_all()).pack(fill="x", pady=3)
@@ -222,7 +231,7 @@ class LOMDepthAnalyserWindow(ctk.CTkToplevel):
 
     # -- graph -----------------------------------------------------------
     def _build_graph(self, frame):
-        self.fig = Figure(figsize=(8.5, 6), facecolor=BG)
+        self.fig = Figure(figsize=(8.5, 6), facecolor=self.fig_bg_color.get())
         self.ax = self.fig.add_subplot(111)
         self.canvas = FigureCanvasTkAgg(self.fig, master=frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
@@ -233,8 +242,7 @@ class LOMDepthAnalyserWindow(ctk.CTkToplevel):
     # -- right panel -----------------------------------------------------
     def _build_right(self, p):
         self._section(p, "STATISTICS")
-        self.stats_box = ctk.CTkTextbox(p, height=330, font=("Consolas", 11),
-                                        fg_color=PLOT_BG, wrap="none")
+        self.stats_box = ctk.CTkTextbox(p, height=330, font=("Consolas", 11), wrap="none")
         self.stats_box.pack(fill="both", expand=True, pady=5)
 
         self._section(p, "GRAPH LABELS")
@@ -251,8 +259,12 @@ class LOMDepthAnalyserWindow(ctk.CTkToplevel):
                       fg_color="gray40").pack(fill="x", pady=3)
 
         self._section(p, "DESIGN & LEGEND")
-        ctk.CTkComboBox(p, variable=self.legend_pos_var, values=list(LEGEND_POSITIONS.keys()),
+        ctk.CTkLabel(p, text="Legend position :").pack(anchor="w")
+        ctk.CTkComboBox(p, variable=self.legend_pos_var, values=list(LOM_LEGEND_POSITIONS.keys()),
                         command=lambda _v: self._plot()).pack(fill="x", pady=5)
+        ctk.CTkLabel(p, text="Graph background :").pack(anchor="w")
+        ctk.CTkComboBox(p, variable=self.bg_preset_var, values=list(BACKGROUND_PRESETS.keys()),
+                        command=self._apply_bg_preset).pack(fill="x", pady=5)
         self._slider(p, "Bar opacity :", self.bar_alpha, 0.1, 1.0)
         self._slider(p, "Line thickness :", self.line_width, 0.5, 5.0)
         self._slider(p, "Font size :", self.font_size, 7, 18)
@@ -272,6 +284,12 @@ class LOMDepthAnalyserWindow(ctk.CTkToplevel):
                       command=self._export_excel).pack(fill="x", pady=2)
         ctk.CTkButton(p, text="📑 Generate PDF report", fg_color="#882255",
                       hover_color="#551133", command=self._export_pdf).pack(fill="x", pady=(10, 15))
+
+    def _apply_bg_preset(self, name):
+        hexcode = BACKGROUND_PRESETS.get(name, PLOT_BG)
+        self.plot_bg_color.set(hexcode)
+        self.fig_bg_color.set(BACKGROUND_PRESETS["Figure Dark"] if name == "Dark (default)" else hexcode)
+        self._plot()
 
     def _slider(self, parent, label, var, from_, to):
         row = ctk.CTkFrame(parent, fg_color="transparent")
@@ -365,10 +383,11 @@ class LOMDepthAnalyserWindow(ctk.CTkToplevel):
         self._refresh_all()
 
     def _pick_color(self, group, button):
-        col = colorchooser.askcolor(color=group.color, title=f"Color of '{group.name}'", parent=self)
-        if col and col[1]:
-            group.color = col[1]
-            button.configure(fg_color=col[1])
+        col = ColorPickerDialog.ask_color(self.winfo_toplevel(), initial_color=group.color,
+                                          title=f"Color of '{group.name}'")
+        if col:
+            group.color = col
+            button.configure(fg_color=col)
             self._plot()
 
     def _rename(self, group, entry):
@@ -559,10 +578,10 @@ class LOMDepthAnalyserWindow(ctk.CTkToplevel):
     # ─────────────────────────────────────────────────────────────────────
     #  Plotting
     # ─────────────────────────────────────────────────────────────────────
-    def _draw(self, ax, fig, light=False):
-        face = "white" if light else PLOT_BG
-        figface = "white" if light else BG
-        tc = "black" if light else "white"
+    def _draw_distribution(self, ax, fig, light=False):
+        face = "white" if light else self.plot_bg_color.get()
+        figface = "white" if light else self.fig_bg_color.get()
+        tc = "black" if light else contrast_text_color(face)
         fs = self.font_size.get()
 
         ax.clear()
@@ -610,7 +629,7 @@ class LOMDepthAnalyserWindow(ctk.CTkToplevel):
                 ax.axvline(st["mean"], color=g.color, linestyle="--", linewidth=1.2, zorder=4)
                 ax.axvline(st["median"], color=g.color, linestyle=":", linewidth=1.4, zorder=4)
 
-        pos = LEGEND_POSITIONS.get(self.legend_pos_var.get(), "outside right")
+        pos = LOM_LEGEND_POSITIONS.get(self.legend_pos_var.get(), "outside right")
         if pos != "none" and ax.get_legend_handles_labels()[0]:
             args = {"frameon": True, "facecolor": face, "labelcolor": tc, "fontsize": fs}
             if pos == "outside right":
@@ -623,7 +642,7 @@ class LOMDepthAnalyserWindow(ctk.CTkToplevel):
                     va="top", ha="left", fontsize=max(8, fs - 2), color=tc, alpha=0.8)
 
     def _plot(self):
-        self._draw(self.ax, self.fig, light=False)
+        self._draw_distribution(self.ax, self.fig, light=False)
         try:
             self.fig.tight_layout()
         except Exception:                                  # noqa: BLE001
@@ -632,9 +651,9 @@ class LOMDepthAnalyserWindow(ctk.CTkToplevel):
 
     def _make_export_figure(self):
         light = self.light_export.get()
-        fig = Figure(figsize=(10, 6.5), facecolor="white" if light else BG)
+        fig = Figure(figsize=(10, 6.5), facecolor="white" if light else self.fig_bg_color.get())
         ax = fig.add_subplot(111)
-        self._draw(ax, fig, light=light)
+        self._draw_distribution(ax, fig, light=light)
         try:
             fig.tight_layout()
         except Exception:                                  # noqa: BLE001
@@ -715,6 +734,9 @@ class LOMDepthAnalyserWindow(ctk.CTkToplevel):
             kept += len(k)
         self.filter_info.configure(
             text=f"{kept} value(s) kept / {tot} loaded  ({tot - kept} excluded)")
+        if self.groups:
+            self._status(f"LOM Depth Analyser — {len(self.groups)} group(s), "
+                         f"{kept} value(s) kept / {tot} loaded.")
 
     def _refresh_all(self):
         self._refresh_measures()
@@ -743,6 +765,7 @@ class LOMDepthAnalyserWindow(ctk.CTkToplevel):
         fig = self._make_export_figure()
         fig.savefig(path, dpi=300, bbox_inches="tight",
                     facecolor=fig.get_facecolor())
+        self._status(f"LOM graph saved: {os.path.basename(path)}")
         messagebox.showinfo("Success", f"Graph saved:\n{path}", parent=self)
 
     def _export_frames(self):
@@ -796,6 +819,7 @@ class LOMDepthAnalyserWindow(ctk.CTkToplevel):
                                            lineterminator="\n")
                     else:
                         f.write("(empty)\n")
+            self._status(f"LOM data exported: {os.path.basename(path)}")
             messagebox.showinfo("Success", f"Data exported:\n{path}", parent=self)
         except Exception as exc:                          # noqa: BLE001
             messagebox.showerror("Export error", str(exc), parent=self)
@@ -826,6 +850,7 @@ class LOMDepthAnalyserWindow(ctk.CTkToplevel):
                     used.add(name)
                     build_values_frame(g, measures, vmin, vmax).to_excel(
                         w, sheet_name=name, index=False)
+            self._status(f"LOM data exported: {os.path.basename(path)}")
             messagebox.showinfo("Success", f"Data exported:\n{path}", parent=self)
         except Exception as exc:                          # noqa: BLE001
             messagebox.showerror("Export error",
@@ -855,14 +880,34 @@ class LOMDepthAnalyserWindow(ctk.CTkToplevel):
                     pdf.savefig(fig_t)
                 fig = self._make_export_figure()
                 pdf.savefig(fig, bbox_inches="tight", facecolor=fig.get_facecolor())
+            self._status(f"LOM PDF report generated: {os.path.basename(path)}")
             messagebox.showinfo("Success", f"PDF report generated:\n{path}", parent=self)
         except Exception as exc:                          # noqa: BLE001
             messagebox.showerror("Export error", f"Failed to build PDF:\n{exc}", parent=self)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Stand-alone launcher
+#  Same module in its own window (optional) + stand-alone launcher
 # ─────────────────────────────────────────────────────────────────────────────
+class LOMDepthAnalyserWindow(ctk.CTkToplevel):
+    """Hosts the exact same panel in a separate window."""
+
+    def __init__(self, master=None, status_callback=None):
+        super().__init__(master)
+        self.title("LOM Depth Analyser — depth distribution & statistics")
+        self.geometry("1650x920")
+        self.minsize(1150, 700)
+        self.panel = LOMDepthAnalyserPanel(self, status_callback=status_callback)
+        self.panel.pack(fill="both", expand=True)
+        if master is not None:
+            try:
+                if master.winfo_viewable():
+                    self.transient(master)
+            except Exception:                             # noqa: BLE001
+                pass
+        self.after(200, self.lift)
+
+
 def main():
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")

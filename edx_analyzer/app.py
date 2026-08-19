@@ -1,5 +1,7 @@
-"""Main application window: UI layout, plotting, and Matplotlib event
-handling for the EDX Line Scan Viewer."""
+"""Main application window of the analysis suite: hosts the three modules
+(EDX Line Scan Analyser, SEM Picture Analyser, LOM Depth Analyser) in a tab
+bar, plus the UI layout, plotting and Matplotlib event handling of the EDX
+module itself."""
 
 import os
 import json
@@ -22,6 +24,7 @@ from .manual_zones import ManualZoneDialog, ManualZoneManagerWindow
 from .widgets import ColorPickerDialog, add_tooltip
 from .history import ChangeHistory
 from .image_measurement import ImageMeasurementMixin
+from .lom_depth_analyser import LOMDepthAnalyserPanel
 from .report import ReportInfoDialog, generate_pdf_report
 
 try:
@@ -33,6 +36,11 @@ except ImportError:
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
+
+# Labels of the three modules; the tab bar acts as the module selector.
+TAB_EDX = "EDX Line Scan Analyser"
+TAB_SEM = "SEM Picture Analyser"
+TAB_LOM = "LOM Depth Analyser"
 
 # Drag-and-drop support requires mixing in TkinterDnD's wrapper alongside
 # CTk's root window class; fall back to plain CTk if the optional
@@ -47,7 +55,7 @@ else:
 class EDXApp(_AppBase, ImageMeasurementMixin):
     def __init__(self):
         super().__init__()
-        self.title("EDX Line Scan Viewer - Lab Edition (PDF Reports)")
+        self.title("Lab Analysis Suite — EDX Line Scan · SEM Picture · LOM Depth")
         self.geometry("1600x900")
 
         self.df_raw, self.df_norm = None, None
@@ -78,7 +86,8 @@ class EDXApp(_AppBase, ImageMeasurementMixin):
         self.roi_selector = None
 
         self.appearance_var = ctk.StringVar(value="Dark")
-        self.status_var = tk.StringVar(value="Ready. Load an EDX .txt file to begin.")
+        self.status_var = tk.StringVar(
+            value="Ready. Pick a module in the tab bar: EDX Line Scan · SEM Picture · LOM Depth.")
 
         self.change_history = ChangeHistory()
         self._last_style_snapshot = None
@@ -107,11 +116,13 @@ class EDXApp(_AppBase, ImageMeasurementMixin):
 
         self.tabview = ctk.CTkTabview(self, corner_radius=0)
         self.tabview.grid(row=0, column=0, sticky="nsew")
-        edx_tab = self.tabview.add("EDX Analysis")
-        image_tab = self.tabview.add("SEM Image & Measurements")
+        edx_tab = self.tabview.add(TAB_EDX)
+        image_tab = self.tabview.add(TAB_SEM)
+        lom_tab = self.tabview.add(TAB_LOM)
 
         self._build_edx_tab(edx_tab)
         self._build_image_tab(image_tab)
+        self._build_lom_tab(lom_tab)
         # A tab built while hidden gets a matplotlib canvas sized 0x0; force a
         # redraw once it's actually shown so the figure renders at real size.
         self.tabview.configure(command=self._on_tab_changed)
@@ -151,6 +162,13 @@ class EDXApp(_AppBase, ImageMeasurementMixin):
         self._build_graph(graph_inside_frame)
         self._build_right(self.right_panel)
 
+    def _build_lom_tab(self, tab):
+        """The LOM module is fully self-contained: it just fills its tab."""
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+        self.lom_panel = LOMDepthAnalyserPanel(tab, status_callback=self._set_status)
+        self.lom_panel.grid(row=0, column=0, sticky="nsew")
+
     def _set_status(self, message):
         self.status_var.set(message)
 
@@ -159,8 +177,11 @@ class EDXApp(_AppBase, ImageMeasurementMixin):
         # 0x0 while hidden; force a layout pass before redrawing so the
         # first switch doesn't show a stale/blank frame.
         self.update_idletasks()
-        if self.tabview.get() == "SEM Image & Measurements":
+        current = self.tabview.get()
+        if current == TAB_SEM:
             self._redraw_image()
+        elif current == TAB_LOM:
+            self.lom_panel.on_shown()
         elif self.df_norm is not None:
             self._plot()
 

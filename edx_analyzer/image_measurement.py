@@ -61,7 +61,7 @@ class CalibrationDialog(ctk.CTkToplevel):
 
 
 class ImageMeasurementMixin:
-    """Provides the whole 'SEM Image & Measurements' tab. Expects the host
+    """Provides the whole 'SEM Picture Analyser' tab. Expects the host
     class to also provide `_set_status(message)`."""
 
     def _init_image_state(self):
