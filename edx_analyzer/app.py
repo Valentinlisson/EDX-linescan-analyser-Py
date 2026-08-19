@@ -16,11 +16,14 @@ from matplotlib.figure import Figure
 import matplotlib.ticker as ticker
 from matplotlib.widgets import SpanSelector
 
-from .constants import COLORS_DEFAULT, MARKERS, LEGEND_POSITIONS, BACKGROUND_PRESETS, BG, ACCENT
+from .constants import (COLORS_DEFAULT, MARKERS, LEGEND_POSITIONS, BACKGROUND_PRESETS,
+                        ZONE_LABEL_POSITIONS, ZONE_LABEL_ORIENTATIONS, ZONE_LABEL_FONTS,
+                        DEFAULT_ZONE_ALPHA, BG, ACCENT)
+from .legend_utils import apply_legend, fit_layout
 from .color_utils import contrast_text_color
 from .data_processing import parse_edx_file, get_elements, get_pos_col, normalize_to_100
 from .phase_manager import PhaseManagerWindow
-from .manual_zones import ManualZoneDialog, ManualZoneManagerWindow
+from .manual_zones import ManualZoneDialog, ManualZoneManagerWindow, DEFAULT_ZONE_COLOR
 from .widgets import ColorPickerDialog, add_tooltip
 from .history import ChangeHistory
 from .image_measurement import ImageMeasurementMixin
@@ -80,6 +83,12 @@ class EDXApp(_AppBase, ImageMeasurementMixin):
         self.show_grid = ctk.BooleanVar(value=True)
         self.font_size = ctk.IntVar(value=10)
         self.legend_pos_var = ctk.StringVar(value="Outside Right")
+
+        # How the name of a zone (auto or manual) is written on the graph.
+        self.zone_label_pos_var = ctk.StringVar(value="Above graph")
+        self.zone_label_orient_var = ctk.StringVar(value="Horizontal")
+        self.zone_label_font_var = ctk.StringVar(value=ZONE_LABEL_FONTS[0])
+        self.zone_label_size = ctk.IntVar(value=9)
 
         self.scale_x, self.scale_y = ctk.DoubleVar(value=1.0), ctk.DoubleVar(value=1.0)
         self._slider_interacting, self._pan_start = False, None
@@ -235,6 +244,27 @@ class EDXApp(_AppBase, ImageMeasurementMixin):
         clear_manual_btn = ctk.CTkButton(p, text="❌ Clear Manual Zones", fg_color="gray40", hover_color="gray30", command=self._clear_manual_zones)
         clear_manual_btn.pack(fill="x", pady=2)
         add_tooltip(clear_manual_btn, "Remove all manual zone markers from the graph.")
+        ctk.CTkLabel(p, text="Color and shading opacity are set per zone, in the zone dialog.",
+                     text_color="gray", font=("Arial", 10), wraplength=240, justify="left").pack(anchor="w", pady=(4, 0))
+
+        self._section(p, "ZONE NAMES")
+        ctk.CTkLabel(p, text="Applies to auto-detected and manual zones.", text_color="gray",
+                     font=("Arial", 10), wraplength=240, justify="left").pack(anchor="w")
+        ctk.CTkLabel(p, text="Placement :").pack(anchor="w", pady=(6, 0))
+        zone_pos_combo = ctk.CTkComboBox(p, variable=self.zone_label_pos_var,
+                                         values=list(ZONE_LABEL_POSITIONS.keys()),
+                                         command=self._on_zone_label_change)
+        zone_pos_combo.pack(fill="x", pady=2)
+        add_tooltip(zone_pos_combo, "'Above graph' and 'Below axis' keep the zone names\n"
+                                    "completely outside the curves.")
+        ctk.CTkLabel(p, text="Orientation :").pack(anchor="w", pady=(6, 0))
+        ctk.CTkComboBox(p, variable=self.zone_label_orient_var,
+                        values=list(ZONE_LABEL_ORIENTATIONS.keys()),
+                        command=self._on_zone_label_change).pack(fill="x", pady=2)
+        ctk.CTkLabel(p, text="Font :").pack(anchor="w", pady=(6, 0))
+        ctk.CTkComboBox(p, variable=self.zone_label_font_var, values=ZONE_LABEL_FONTS,
+                        command=self._on_zone_label_change).pack(fill="x", pady=2)
+        self._slider_generic(p, "Zone name size :", self.zone_label_size, 6, 20)
 
         self._section(p, "ELEMENTS")
         self.el_frame = ctk.CTkFrame(p, fg_color="transparent")
@@ -374,6 +404,10 @@ class EDXApp(_AppBase, ImageMeasurementMixin):
         self._record_style_change()
         self._plot()
 
+    def _on_zone_label_change(self, value=None):
+        self._record_style_change()
+        self._plot()
+
     def _on_legend_change(self, value):
         self._record_style_change()
         self._plot()
@@ -430,7 +464,11 @@ class EDXApp(_AppBase, ImageMeasurementMixin):
             "plot_bg": self.plot_bg_color.get(), "fig_bg": self.fig_bg_color.get(),
             "lw": self.line_width.get(), "ms": self.marker_size.get(), "fs": self.font_size.get(),
             "legend": self.legend_pos_var.get(), "colors": self.el_colors,
-            "markers": {k: v.get() for k, v in self.el_markers.items()}
+            "markers": {k: v.get() for k, v in self.el_markers.items()},
+            "zone_label_pos": self.zone_label_pos_var.get(),
+            "zone_label_orient": self.zone_label_orient_var.get(),
+            "zone_label_font": self.zone_label_font_var.get(),
+            "zone_label_size": self.zone_label_size.get(),
         }
         with open(p, 'w') as f:
             json.dump(data, f)
@@ -449,6 +487,10 @@ class EDXApp(_AppBase, ImageMeasurementMixin):
             self.fig_bg_btn.configure(fg_color=self.fig_bg_color.get())
             self.line_width.set(data.get("lw", 1.8)); self.marker_size.set(data.get("ms", 5.0)); self.font_size.set(data.get("fs", 10))
             self.legend_pos_var.set(data.get("legend", "Outside Right"))
+            self.zone_label_pos_var.set(data.get("zone_label_pos", "Above graph"))
+            self.zone_label_orient_var.set(data.get("zone_label_orient", "Horizontal"))
+            self.zone_label_font_var.set(data.get("zone_label_font", ZONE_LABEL_FONTS[0]))
+            self.zone_label_size.set(data.get("zone_label_size", 9))
             if "colors" in data:
                 self.el_colors.update(data["colors"])
             if "markers" in data:
@@ -535,6 +577,9 @@ class EDXApp(_AppBase, ImageMeasurementMixin):
             "grid": self.show_grid.get(),
             "colors": dict(self.el_colors),
             "markers": {k: v.get() for k, v in self.el_markers.items()},
+            "zone_label_pos": self.zone_label_pos_var.get(),
+            "zone_label_orient": self.zone_label_orient_var.get(),
+            "zone_label_font": self.zone_label_font_var.get(),
         }
 
     def _restore_style_state(self, state):
@@ -544,6 +589,9 @@ class EDXApp(_AppBase, ImageMeasurementMixin):
         self.fig_bg_btn.configure(fg_color=state["fig_bg"])
         self.legend_pos_var.set(state["legend"])
         self.show_grid.set(state["grid"])
+        self.zone_label_pos_var.set(state.get("zone_label_pos", "Above graph"))
+        self.zone_label_orient_var.set(state.get("zone_label_orient", "Horizontal"))
+        self.zone_label_font_var.set(state.get("zone_label_font", ZONE_LABEL_FONTS[0]))
         self.el_colors.clear()
         self.el_colors.update(state["colors"])
         for k, v in state["markers"].items():
@@ -603,8 +651,10 @@ class EDXApp(_AppBase, ImageMeasurementMixin):
         self.ax.yaxis.label.set_color(tc)
         self.ax.title.set_color(tc)
 
-        # INCREASE PAD TO MAKE ROOM FOR ZONE LABELS
-        pad_amount = 30 if self.detected_zones else 10
+        # Make room above the axes only when the zone names actually sit there.
+        labels_above = (self.zone_label_pos_var.get() == "Above graph"
+                        and (self.detected_zones or self.manual_zones))
+        pad_amount = max(30, int(self.zone_label_size.get() * 2.6)) if labels_above else 10
         self.ax.set_title(self.graph_title, fontsize=fs + 2, fontweight='bold', pad=pad_amount)
 
         self.ax.set_xlabel(self.graph_xlabel, fontsize=fs)
@@ -858,26 +908,21 @@ class EDXApp(_AppBase, ImageMeasurementMixin):
         if self.detected_zones:
             for zone in self.detected_zones:
                 self.ax.axvline(x=zone["start"], color="#E69F00", linestyle=":", linewidth=1.5, zorder=1)
+                self._draw_zone_label((zone["start"] + zone["end"]) / 2, zone["name"],
+                                      zone_text_color, boxed=True)
 
-                # Safe text placement (doesn't touch the curves nor the title)
-                mid_x = (zone["start"] + zone["end"]) / 2
-                self.ax.text(mid_x, 1.02, zone["name"], transform=self.ax.get_xaxis_transform(),
-                             ha="center", va="bottom", fontsize=max(8, fs - 1), color=zone_text_color,
-                             bbox=dict(facecolor=self.plot_bg_color.get(), edgecolor='none', alpha=0.7),
-                             clip_on=False, zorder=5)
-
-        # Manual zones use a shaded span + in-plot rotated label so they stay
-        # visually distinct from the auto-detected zones' floating labels.
+        # Manual zones add a shaded span whose color and opacity belong to the
+        # zone itself (edited in the zone dialog).
         if self.manual_zones:
             for zone in self.manual_zones:
-                zcolor = zone.get("color", "#CC79A7")
-                self.ax.axvspan(zone["start"], zone["end"], color=zcolor, alpha=0.12, zorder=0)
+                zcolor = zone.get("color", DEFAULT_ZONE_COLOR)
+                zalpha = float(zone.get("alpha", DEFAULT_ZONE_ALPHA))
+                if zalpha > 0:
+                    self.ax.axvspan(zone["start"], zone["end"], color=zcolor, alpha=zalpha, zorder=0)
                 self.ax.axvline(x=zone["start"], color=zcolor, linestyle="-", linewidth=1.3, zorder=2)
                 self.ax.axvline(x=zone["end"], color=zcolor, linestyle="-", linewidth=1.3, zorder=2)
-                mid_x = (zone["start"] + zone["end"]) / 2
-                self.ax.text(mid_x, 0.96, zone["name"], transform=self.ax.get_xaxis_transform(),
-                             ha="center", va="top", rotation=90, fontsize=max(8, fs - 1), color=zcolor,
-                             fontweight="bold", clip_on=True, zorder=6)
+                self._draw_zone_label((zone["start"] + zone["end"]) / 2, zone["name"],
+                                      zcolor, bold=True)
 
         for el in self.elements:
             if not self.el_vars.get(el, ctk.BooleanVar(value=True)).get():
@@ -899,20 +944,37 @@ class EDXApp(_AppBase, ImageMeasurementMixin):
             self.ax.set_xlim([xcen - hs, xcen + hs])
             self.ax.set_ylim([0, (ymax * 1.05) / self.scale_y.get()])
 
-        if any(v.get() for v in self.el_vars.values()):
-            pos = LEGEND_POSITIONS.get(self.legend_pos_var.get(), "outside right")
-            args = {"frameon": True, "facecolor": self.plot_bg_color.get(), "labelcolor": contrast_text_color(self.plot_bg_color.get())}
-            if pos == "outside right":
-                self.ax.legend(**args, loc="upper left", bbox_to_anchor=(1.02, 1))
-            else:
-                self.ax.legend(**args, loc=pos)
+        apply_legend(self.ax, self.legend_pos_var.get(),
+                     facecolor=self.plot_bg_color.get(),
+                     labelcolor=contrast_text_color(self.plot_bg_color.get()), fontsize=fs)
 
         self.ax.xaxis.set_major_locator(ticker.AutoLocator())
         self.ax.yaxis.set_major_locator(ticker.AutoLocator())
-        self.fig.tight_layout()
+        fit_layout(self.fig, self.legend_pos_var.get())
+        if (self.zone_label_pos_var.get() == "Below axis"
+                and (self.detected_zones or self.manual_zones)):
+            # tight_layout only knows about the axis label: give the zone
+            # names written under it a bit of room of their own.
+            self.fig.subplots_adjust(bottom=min(0.45, self.fig.subplotpars.bottom + 0.07))
         self.canvas.draw()
 
     # --- ROI and Events ---
+    def _draw_zone_label(self, x, text, color, boxed=False, bold=False):
+        """Write a zone name where the user asked for it (ZONE NAMES panel)."""
+        placement = ZONE_LABEL_POSITIONS.get(self.zone_label_pos_var.get())
+        if placement is None:                       # "Hidden"
+            return
+        y, va, clip = placement
+        args = dict(transform=self.ax.get_xaxis_transform(), ha="center", va=va,
+                    rotation=ZONE_LABEL_ORIENTATIONS.get(self.zone_label_orient_var.get(), 0),
+                    fontsize=self.zone_label_size.get(), color=color,
+                    fontfamily=self.zone_label_font_var.get(), clip_on=clip, zorder=6)
+        if bold:
+            args["fontweight"] = "bold"
+        if boxed:
+            args["bbox"] = dict(facecolor=self.plot_bg_color.get(), edgecolor="none", alpha=0.7)
+        self.ax.text(x, y, text, **args)
+
     def _set_span_selector(self, onselect):
         """(Re)activate the graph's drag-select tool. Only one drag tool
         (ROI stats vs. manual zone placement) can usefully be active at a

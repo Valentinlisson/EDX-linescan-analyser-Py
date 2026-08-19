@@ -33,6 +33,7 @@ from matplotlib.figure import Figure
 
 from .constants import COLORS_DEFAULT, BACKGROUND_PRESETS, LEGEND_POSITIONS, ACCENT
 from .color_utils import contrast_text_color
+from .legend_utils import apply_legend, fit_layout
 from .widgets import ColorPickerDialog, add_tooltip
 from .lom_depth_core import (
     DepthGroup,
@@ -58,8 +59,6 @@ Y_MODES = {"Count (occurrences)": "count", "Percentage (%)": "percent", "Density
 CURVE_STYLES = ["Bars", "Line", "Bars + Line", "Step"]
 MAX_BINS = 5000                      # safety limit for a very small grouping factor
 ORIGIN_MODES = ["Auto (min of data)", "Zero", "Custom"]
-# Same placements as the EDX module, plus a "no legend" choice for this graph.
-LOM_LEGEND_POSITIONS = dict(LEGEND_POSITIONS, **{"None": "none"})
 
 
 class LOMDepthAnalyserPanel(ctk.CTkFrame):
@@ -260,7 +259,7 @@ class LOMDepthAnalyserPanel(ctk.CTkFrame):
 
         self._section(p, "DESIGN & LEGEND")
         ctk.CTkLabel(p, text="Legend position :").pack(anchor="w")
-        ctk.CTkComboBox(p, variable=self.legend_pos_var, values=list(LOM_LEGEND_POSITIONS.keys()),
+        ctk.CTkComboBox(p, variable=self.legend_pos_var, values=list(LEGEND_POSITIONS.keys()),
                         command=lambda _v: self._plot()).pack(fill="x", pady=5)
         ctk.CTkLabel(p, text="Graph background :").pack(anchor="w")
         ctk.CTkComboBox(p, variable=self.bg_preset_var, values=list(BACKGROUND_PRESETS.keys()),
@@ -629,13 +628,7 @@ class LOMDepthAnalyserPanel(ctk.CTkFrame):
                 ax.axvline(st["mean"], color=g.color, linestyle="--", linewidth=1.2, zorder=4)
                 ax.axvline(st["median"], color=g.color, linestyle=":", linewidth=1.4, zorder=4)
 
-        pos = LOM_LEGEND_POSITIONS.get(self.legend_pos_var.get(), "outside right")
-        if pos != "none" and ax.get_legend_handles_labels()[0]:
-            args = {"frameon": True, "facecolor": face, "labelcolor": tc, "fontsize": fs}
-            if pos == "outside right":
-                ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1), **args)
-            else:
-                ax.legend(loc=pos, **args)
+        apply_legend(ax, self.legend_pos_var.get(), facecolor=face, labelcolor=tc, fontsize=fs)
 
         if self.show_stat_lines.get():
             ax.text(0.01, 0.99, "-- mean   ·· median", transform=ax.transAxes,
@@ -643,10 +636,7 @@ class LOMDepthAnalyserPanel(ctk.CTkFrame):
 
     def _plot(self):
         self._draw_distribution(self.ax, self.fig, light=False)
-        try:
-            self.fig.tight_layout()
-        except Exception:                                  # noqa: BLE001
-            pass
+        fit_layout(self.fig, self.legend_pos_var.get())
         self.canvas.draw()
 
     def _make_export_figure(self):
@@ -654,10 +644,7 @@ class LOMDepthAnalyserPanel(ctk.CTkFrame):
         fig = Figure(figsize=(10, 6.5), facecolor="white" if light else self.fig_bg_color.get())
         ax = fig.add_subplot(111)
         self._draw_distribution(ax, fig, light=light)
-        try:
-            fig.tight_layout()
-        except Exception:                                  # noqa: BLE001
-            pass
+        fit_layout(fig, self.legend_pos_var.get())
         return fig
 
     # ─────────────────────────────────────────────────────────────────────

@@ -9,7 +9,8 @@ import customtkinter as ctk
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
 
-from .constants import ACCENT, LEGEND_POSITIONS
+from .constants import ACCENT
+from .legend_utils import apply_legend, fit_layout
 from .data_processing import get_pos_col
 
 LINES_PER_PAGE = 55
@@ -158,13 +159,9 @@ def _add_graph_page(pdf, app):
         app.ax.xaxis.label.set_color("black")
         app.ax.yaxis.label.set_color("black")
         app.ax.title.set_color("black")
-        if any(v.get() for v in app.el_vars.values()):
-            pos = LEGEND_POSITIONS.get(app.legend_pos_var.get(), "outside right")
-            args = {"frameon": True, "facecolor": "white", "labelcolor": "black"}
-            if pos == "outside right":
-                app.ax.legend(**args, loc="upper left", bbox_to_anchor=(1.02, 1))
-            else:
-                app.ax.legend(**args, loc=pos)
+        apply_legend(app.ax, app.legend_pos_var.get(), facecolor="white", labelcolor="black",
+                     fontsize=app.font_size.get())
+        fit_layout(app.fig, app.legend_pos_var.get())
         pdf.savefig(app.fig, bbox_inches="tight")
     finally:
         app._style_axes()
