@@ -353,6 +353,20 @@ class LOMDepthAnalyserPanel(ctk.CTkFrame):
         self.groups.append(group)
         self._refresh_all()
 
+    def add_measurement_group(self, name, values, unit: str = "µm",
+                              measure: str = "Image thickness"):
+        """
+        Public entry point used by the Image Zone Analyser: build a group out of
+        values measured elsewhere, with no CSV file involved.
+        """
+        color = GROUP_COLORS[len(self.groups) % len(GROUP_COLORS)]
+        group = DepthGroup(name, color)
+        if group.add_values(values, name, unit=unit, measure=measure) == 0:
+            return None
+        self.groups.append(group)
+        self._refresh_all()
+        return group
+
     def _add_files(self, group):
         paths = self._ask_files()
         if paths:

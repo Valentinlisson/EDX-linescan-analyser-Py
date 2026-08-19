@@ -277,6 +277,33 @@ class DepthGroup:
         self.files.append({"path": path, "name": os.path.basename(path), "df": df})
         return len(df)
 
+    def add_values(self, values, source_name: str, unit: str = "µm",
+                   measure: str = "Image thickness") -> int:
+        """
+        Add measurements that do not come from a CSV file - typically the
+        thicknesses measured on a micrograph by the Image Zone Analyser.
+        Returns how many values were added.
+        """
+        vals = np.asarray(values, dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            return 0
+        path = f"<{source_name}>"
+        i = 2
+        while self.has_file(path):                 # keep the pseudo-path unique
+            path = f"<{source_name} ({i})>"
+            i += 1
+        df = pd.DataFrame({
+            "No": np.arange(1, vals.size + 1, dtype=int),
+            "Measure": measure,
+            "Result": vals,
+            "Unit": unit,
+            "File": source_name,
+            "Source": path,
+        })[COLUMNS]
+        self.files.append({"path": path, "name": source_name, "df": df})
+        return int(len(df))
+
     def remove_file(self, path: str):
         self.files = [f for f in self.files if f["path"] != path]
 

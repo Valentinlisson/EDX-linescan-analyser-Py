@@ -5,6 +5,11 @@ numpy>=1.24.0
 openpyxl>=3.1.0
 pillow>=10.0.0
 
+# Image Zone Analyser: segmentation and measurement of the micrographs.
+# The module tells you to install them and stays disabled if they are missing.
+scipy>=1.10.0
+scikit-image>=0.21.0
+
 # Optional: enables drag-and-drop file loading.
 # The app falls back gracefully (drag-and-drop simply disabled) if this
 # isn't installed, since tkinterdnd2 has no prebuilt wheels on some platforms.

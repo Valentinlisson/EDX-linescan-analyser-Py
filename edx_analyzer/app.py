@@ -1,7 +1,7 @@
 """Main application window of the analysis suite: hosts the three modules
-(EDX Line Scan Analyser, SEM Picture Analyser, LOM Depth Analyser) in a tab
-bar, plus the UI layout, plotting and Matplotlib event handling of the EDX
-module itself."""
+(EDX Line Scan Analyser, SEM Picture Analyser, Image Zone Analyser, LOM Depth
+Analyser) in a tab bar, plus the UI layout, plotting and Matplotlib event
+handling of the EDX module itself."""
 
 import os
 import json
@@ -28,6 +28,7 @@ from .widgets import ColorPickerDialog, add_tooltip
 from .history import ChangeHistory
 from .image_measurement import ImageMeasurementMixin
 from .lom_depth_analyser import LOMDepthAnalyserPanel
+from .image_zones import ImageZoneAnalyserPanel
 from .report import ReportInfoDialog, generate_pdf_report
 
 try:
@@ -40,9 +41,10 @@ except ImportError:
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-# Labels of the three modules; the tab bar acts as the module selector.
+# Labels of the four modules; the tab bar acts as the module selector.
 TAB_EDX = "EDX Line Scan Analyser"
 TAB_SEM = "SEM Picture Analyser"
+TAB_IMG = "Image Zone Analyser"
 TAB_LOM = "LOM Depth Analyser"
 
 # Drag-and-drop support requires mixing in TkinterDnD's wrapper alongside
@@ -58,7 +60,7 @@ else:
 class EDXApp(_AppBase, ImageMeasurementMixin):
     def __init__(self):
         super().__init__()
-        self.title("Lab Analysis Suite — EDX Line Scan · SEM Picture · LOM Depth")
+        self.title("Lab Analysis Suite — EDX Line Scan · SEM Picture · Image Zones · LOM Depth")
         self.geometry("1600x900")
 
         self.df_raw, self.df_norm = None, None
@@ -96,7 +98,8 @@ class EDXApp(_AppBase, ImageMeasurementMixin):
 
         self.appearance_var = ctk.StringVar(value="Dark")
         self.status_var = tk.StringVar(
-            value="Ready. Pick a module in the tab bar: EDX Line Scan · SEM Picture · LOM Depth.")
+            value="Ready. Pick a module in the tab bar: EDX Line Scan · SEM Picture · "
+                  "Image Zones · LOM Depth.")
 
         self.change_history = ChangeHistory()
         self._last_style_snapshot = None
@@ -127,11 +130,15 @@ class EDXApp(_AppBase, ImageMeasurementMixin):
         self.tabview.grid(row=0, column=0, sticky="nsew")
         edx_tab = self.tabview.add(TAB_EDX)
         image_tab = self.tabview.add(TAB_SEM)
+        zone_tab = self.tabview.add(TAB_IMG)
         lom_tab = self.tabview.add(TAB_LOM)
 
         self._build_edx_tab(edx_tab)
         self._build_image_tab(image_tab)
+        # the LOM module is built first: the image module sends its
+        # measurements to it
         self._build_lom_tab(lom_tab)
+        self._build_image_zone_tab(zone_tab)
         # A tab built while hidden gets a matplotlib canvas sized 0x0; force a
         # redraw once it's actually shown so the figure renders at real size.
         self.tabview.configure(command=self._on_tab_changed)
@@ -178,6 +185,26 @@ class EDXApp(_AppBase, ImageMeasurementMixin):
         self.lom_panel = LOMDepthAnalyserPanel(tab, status_callback=self._set_status)
         self.lom_panel.grid(row=0, column=0, sticky="nsew")
 
+    def _build_image_zone_tab(self, tab):
+        """Zone segmentation and measurement on an optical micrograph."""
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+        self.image_zone_panel = ImageZoneAnalyserPanel(
+            tab, status_callback=self._set_status, send_to_lom=self._send_thickness_to_lom)
+        self.image_zone_panel.grid(row=0, column=0, sticky="nsew")
+
+    def _send_thickness_to_lom(self, name, values, unit):
+        """Bridge: thicknesses measured on a micrograph become a group of the
+        LOM Depth Analyser, which already draws distributions and statistics."""
+        group = self.lom_panel.add_measurement_group(name, values, unit=unit)
+        if group is None:
+            messagebox.showinfo("Nothing to send", "No usable value to transfer.")
+            return
+        self.tabview.set(TAB_LOM)
+        self._on_tab_changed()
+        self._set_status(f"{len(values)} thickness(es) sent to the LOM Depth Analyser "
+                         f"as '{name}'.")
+
     def _set_status(self, message):
         self.status_var.set(message)
 
@@ -189,6 +216,8 @@ class EDXApp(_AppBase, ImageMeasurementMixin):
         current = self.tabview.get()
         if current == TAB_SEM:
             self._redraw_image()
+        elif current == TAB_IMG:
+            self.image_zone_panel.on_shown()
         elif current == TAB_LOM:
             self.lom_panel.on_shown()
         elif self.df_norm is not None:
