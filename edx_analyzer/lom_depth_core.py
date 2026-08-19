@@ -360,17 +360,25 @@ def compute_stats(values) -> dict:
     if v.size == 0:
         return {k: float("nan") for k in
                 ("min", "max", "mean", "median", "std", "q1", "q3", "range", "sum")} | {"n": 0}
+    mean = float(np.mean(v))
+    std = float(np.std(v, ddof=1)) if v.size > 1 else 0.0
+    sem = std / np.sqrt(v.size) if v.size else float("nan")
     return {
         "n": int(v.size),
         "min": float(np.min(v)),
         "max": float(np.max(v)),
-        "mean": float(np.mean(v)),
+        "mean": mean,
         "median": float(np.median(v)),
-        "std": float(np.std(v, ddof=1)) if v.size > 1 else 0.0,
+        "std": std,
         "q1": float(np.percentile(v, 25)),
         "q3": float(np.percentile(v, 75)),
         "range": float(np.max(v) - np.min(v)),
         "sum": float(np.sum(v)),
+        # dispersion and how well the mean itself is known
+        "sem": float(sem),                       # standard error of the mean
+        "ci95": float(1.96 * sem),               # half-width of its 95 % interval
+        "cv": float(100.0 * std / mean) if mean else float("nan"),   # in %
+        "iqr": float(np.percentile(v, 75) - np.percentile(v, 25)),
     }
 
 
@@ -416,6 +424,45 @@ def bin_centers(edges) -> np.ndarray:
     return (e[:-1] + e[1:]) / 2.0
 
 
+def histogram_error(counts, mode: str, total: int, width: float):
+    """
+    Counting uncertainty of each column, in the units of the drawn histogram.
+
+    A column holding n measurements carries a Poisson uncertainty of sqrt(n);
+    that is what the error bars show, converted to the same axis as the bars.
+    """
+    n = np.asarray(counts, dtype=float)
+    err = np.sqrt(np.maximum(n, 0.0))
+    if mode == "percent":
+        return 100.0 * err / total if total else err
+    if mode == "density":
+        return err / (total * float(width)) if total and width else err
+    return err
+
+
+def normal_curve(values, edges, mode: str = "count", points: int = 200):
+    """
+    The normal law of same mean and same standard deviation as the data,
+    scaled to the histogram it is drawn over. Returns (x, y) or None.
+    """
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size < 2:
+        return None
+    mean, std = float(v.mean()), float(v.std(ddof=1))
+    if std <= 0:
+        return None
+    e = np.asarray(edges, dtype=float)
+    width = float(np.mean(np.diff(e))) if e.size > 1 else 1.0
+    x = np.linspace(e[0], e[-1], int(points))
+    pdf = np.exp(-0.5 * ((x - mean) / std) ** 2) / (std * np.sqrt(2.0 * np.pi))
+    if mode == "percent":
+        return x, pdf * width * 100.0
+    if mode == "density":
+        return x, pdf
+    return x, pdf * width * v.size
+
+
 def smooth_curve(y, window: int):
     """Rolling mean over `window` bins (used for the distribution line only)."""
     y = np.asarray(y, dtype=float)
@@ -443,8 +490,13 @@ def build_summary_frame(rows) -> pd.DataFrame:
             "Mean": st["mean"],
             "Median": st["median"],
             "Std dev": st["std"],
+            "Variation coef. (%)": st.get("cv", float("nan")),
+            "Std error of mean": st.get("sem", float("nan")),
+            "Mean 95% CI low": st["mean"] - st.get("ci95", float("nan")),
+            "Mean 95% CI high": st["mean"] + st.get("ci95", float("nan")),
             "Q1": st["q1"],
             "Q3": st["q3"],
+            "IQR": st.get("iqr", float("nan")),
             "Range": st["range"],
         })
     return pd.DataFrame(out)

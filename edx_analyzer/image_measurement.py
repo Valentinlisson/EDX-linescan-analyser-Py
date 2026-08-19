@@ -8,7 +8,7 @@ import math
 
 import customtkinter as ctk
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 import matplotlib.image as mpimg
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
@@ -126,6 +126,19 @@ class ImageMeasurementMixin:
         self._refresh_measurements_list()
         clear_meas_btn = ctk.CTkButton(p, text="❌ Clear Measurements", fg_color="gray40", command=self._clear_measurements)
         clear_meas_btn.pack(fill="x", pady=2)
+
+        self._section_img(p, "SEND & SAVE")
+        send_btn = ctk.CTkButton(p, text="➡ Send to LOM Depth Analyser", fg_color="#0072B2",
+                                 hover_color="#005588", command=self._send_measurements_to_lom)
+        send_btn.pack(fill="x", pady=2)
+        add_tooltip(send_btn, "Turn the distances measured here into a group of the\n"
+                              "LOM Depth Analyser tab: distribution, statistics and exports.")
+        csv_btn = ctk.CTkButton(p, text="📄 Save measurements (CSV)", fg_color="gray35",
+                                command=self._export_measurements_csv)
+        csv_btn.pack(fill="x", pady=2)
+        add_tooltip(csv_btn, "Written in the same layout as the microscope's own export\n"
+                             '("No.";"Measure";"Result";"Unit"), so the file can be\n'
+                             "reloaded by the LOM Depth Analyser later on.")
 
     def _build_image_canvas(self, frame):
         self.img_fig = Figure(figsize=(8, 6), facecolor=BG)
@@ -305,6 +318,63 @@ class ImageMeasurementMixin:
         self._refresh_measurements_list()
         self._redraw_image()
         self._set_status("Measurements cleared.")
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Send & save
+    # ─────────────────────────────────────────────────────────────────────
+    def _measurement_values(self):
+        if not self.measurements:
+            messagebox.showinfo("No measurement",
+                                "Measure at least one distance first.")
+            return None
+        return [float(m["real_length"]) for m in self.measurements]
+
+    def _send_measurements_to_lom(self):
+        """Hand the measured distances to the LOM Depth Analyser module."""
+        values = self._measurement_values()
+        if values is None:
+            return
+        bridge = getattr(self, "_send_thickness_to_lom", None)
+        if not callable(bridge):
+            messagebox.showerror("Not available",
+                                 "The LOM Depth Analyser module is not reachable from here.")
+            return
+        default = os.path.splitext(os.path.basename(self.sem_image_path or "SEM measurements"))[0]
+        name = simpledialog.askstring("Send to LOM Depth Analyser",
+                                      "Name of the group to create:",
+                                      initialvalue=default, parent=self)
+        if name is None:
+            return
+        bridge(name.strip() or default, values, self.image_scale_unit)
+
+    def _export_measurements_csv(self):
+        """
+        Save the measurements in the layout of the microscope's own export, so
+        the file can be read back by the LOM Depth Analyser like any other.
+        """
+        values = self._measurement_values()
+        if values is None:
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".csv",
+                                            filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        unit = self.image_scale_unit
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                f.write('"Title";"SEM Picture Analyser measurements"\n')
+                f.write(f'"Image";"{os.path.basename(self.sem_image_path or "-")}"\n')
+                scale = f"{self.image_scale:.6g}" if self.image_scale else "-"
+                f.write(f'"Scale";"{scale} {unit}/px"\n')
+                f.write('"[ Main ]"\n')
+                f.write('"No.";"Measure";"Result";"Unit"\n')
+                for i, m in enumerate(self.measurements, start=1):
+                    value = f"{m['real_length']:.4f}".replace(".", ",")
+                    f.write(f'"{i}";"{m["label"]}";{value};"{unit}"\n')
+            self._set_status(f"{len(values)} measurement(s) saved to {os.path.basename(path)}.")
+            messagebox.showinfo("Success", f"Measurements saved:\n{path}")
+        except Exception as exc:                          # noqa: BLE001
+            messagebox.showerror("Export error", str(exc))
 
     def _clear_calibration(self):
         self.image_scale = None

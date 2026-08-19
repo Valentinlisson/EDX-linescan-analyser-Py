@@ -37,6 +37,8 @@ from .legend_utils import apply_legend, fit_layout
 from .widgets import ColorPickerDialog, add_tooltip
 from .lom_depth_core import (
     DepthGroup,
+    histogram_error,
+    normal_curve,
     LomParseError,
     bin_centers,
     build_histogram_frame,
@@ -85,6 +87,9 @@ class LOMDepthAnalyserPanel(ctk.CTkFrame):
         self.style_var = tk.StringVar(value="Bars + Line")
         self.smooth_var = ctk.IntVar(value=1)
         self.show_stat_lines = ctk.BooleanVar(value=False)
+        self.show_error_bars = ctk.BooleanVar(value=False)
+        self.show_normal_fit = ctk.BooleanVar(value=False)
+        self.show_sigma_bands = ctk.BooleanVar(value=False)
         self._bin_warning_for = None
 
         # ---- design ----------------------------------------------------
@@ -224,6 +229,24 @@ class LOMDepthAnalyserPanel(ctk.CTkFrame):
         self._slider(p, "Curve smoothing (bins) :", self.smooth_var, 1, 15)
         ctk.CTkCheckBox(p, text="Show mean / median lines", variable=self.show_stat_lines,
                         command=self._plot).pack(anchor="w", pady=6)
+
+        self._section(p, "STATISTICS ON THE GRAPH")
+        err_chk = ctk.CTkCheckBox(p, text="Probability error bars (±√n)",
+                                  variable=self.show_error_bars, command=self._plot)
+        err_chk.pack(anchor="w", pady=3)
+        add_tooltip(err_chk, "Counting uncertainty of each column: a column holding\n"
+                             "n measurements is known to about ±√n. Tells a real peak\n"
+                             "from one built on three measurements.")
+        fit_chk = ctk.CTkCheckBox(p, text="Normal law fit", variable=self.show_normal_fit,
+                                  command=self._plot)
+        fit_chk.pack(anchor="w", pady=3)
+        add_tooltip(fit_chk, "Draws the normal law of same mean and same standard\n"
+                             "deviation as the data, scaled to the histogram.")
+        sig_chk = ctk.CTkCheckBox(p, text="Standard deviation bands (±1σ, ±2σ)",
+                                  variable=self.show_sigma_bands, command=self._plot)
+        sig_chk.pack(anchor="w", pady=3)
+        add_tooltip(sig_chk, "Shades mean ±1σ and marks mean ±2σ: about 68 % and 95 %\n"
+                             "of a normal population fall inside them.")
 
         ctk.CTkButton(p, text="↻ Update graph & statistics", command=self._refresh_all,
                       fg_color="#009E73", hover_color="#007755").pack(fill="x", pady=(10, 15))
@@ -623,12 +646,22 @@ class LOMDepthAnalyserPanel(ctk.CTkFrame):
         alpha, lw = self.bar_alpha.get(), self.line_width.get()
         marker = "o" if self.show_markers.get() else None
 
+        mode, width = res["mode"], res["width"]
         for g, values, counts in res["series"]:
             label = f"{g.name} (n={values.size})"
+            raw_counts = histogram(values, res["edges"], "count")
             if style in ("Bars", "Bars + Line"):
+                errors = histogram_error(raw_counts, mode, values.size, width) \
+                    if self.show_error_bars.get() else None
                 ax.bar(centers, counts, width=width * 0.92, color=g.color,
                        alpha=alpha, edgecolor=g.color, linewidth=0.5, zorder=2,
+                       yerr=errors, ecolor=tc, capsize=2,
+                       error_kw={"elinewidth": 0.8, "alpha": 0.7} if errors is not None else None,
                        label=label if style == "Bars" else None)
+            elif self.show_error_bars.get():
+                errors = histogram_error(raw_counts, mode, values.size, width)
+                ax.errorbar(centers, counts, yerr=errors, fmt="none", ecolor=g.color,
+                            elinewidth=0.8, capsize=2, alpha=0.7, zorder=2)
             if style in ("Line", "Bars + Line"):
                 ax.plot(centers, smooth_curve(counts, self.smooth_var.get()), color=g.color,
                         linewidth=lw, marker=marker, markersize=max(3.0, lw * 2),
@@ -637,6 +670,22 @@ class LOMDepthAnalyserPanel(ctk.CTkFrame):
                 ax.step(centers, counts, where="mid", color=g.color, linewidth=lw,
                         marker=marker, markersize=max(3.0, lw * 2), label=label, zorder=3)
 
+            if self.show_normal_fit.get():
+                fit = normal_curve(values, res["edges"], mode)
+                if fit is not None:
+                    ax.plot(fit[0], fit[1], color=g.color, linewidth=lw + 0.4,
+                            linestyle="-.", zorder=5,
+                            label=f"{g.name} — normal fit")
+
+            if self.show_sigma_bands.get():
+                st = compute_stats(values)
+                if np.isfinite(st["std"]) and st["std"] > 0:
+                    ax.axvspan(st["mean"] - st["std"], st["mean"] + st["std"],
+                               color=g.color, alpha=0.12, zorder=1)
+                    for k in (-2, 2):
+                        ax.axvline(st["mean"] + k * st["std"], color=g.color,
+                                   linestyle=(0, (1, 3)), linewidth=1.0, zorder=4)
+
             if self.show_stat_lines.get():
                 st = compute_stats(values)
                 ax.axvline(st["mean"], color=g.color, linestyle="--", linewidth=1.2, zorder=4)
@@ -644,8 +693,15 @@ class LOMDepthAnalyserPanel(ctk.CTkFrame):
 
         apply_legend(ax, self.legend_pos_var.get(), facecolor=face, labelcolor=tc, fontsize=fs)
 
+        hints = []
         if self.show_stat_lines.get():
-            ax.text(0.01, 0.99, "-- mean   ·· median", transform=ax.transAxes,
+            hints.append("-- mean   ·· median")
+        if self.show_sigma_bands.get():
+            hints.append("shaded ±1σ   dotted ±2σ")
+        if self.show_error_bars.get():
+            hints.append("error bars ±√n")
+        if hints:
+            ax.text(0.01, 0.99, "   |   ".join(hints), transform=ax.transAxes,
                     va="top", ha="left", fontsize=max(8, fs - 2), color=tc, alpha=0.8)
 
     def _plot(self):
@@ -701,8 +757,12 @@ class LOMDepthAnalyserPanel(ctk.CTkFrame):
                 lines.append(f"  Mean           : {st['mean']:.4g} {unit}")
                 lines.append(f"  Median         : {st['median']:.4g} {unit}")
                 lines.append(f"  Std dev (n-1)  : {st['std']:.4g} {unit}")
+                lines.append(f"  Variation coef.: {st['cv']:.3g} %")
+                lines.append(f"  Std error mean : {st['sem']:.4g} {unit}")
+                lines.append(f"  Mean 95% CI    : {st['mean'] - st['ci95']:.4g} … "
+                             f"{st['mean'] + st['ci95']:.4g} {unit}")
                 lines.append(f"  Q1 / Q3        : {st['q1']:.4g} / {st['q3']:.4g} {unit}")
-                lines.append(f"  Range          : {st['range']:.4g} {unit}")
+                lines.append(f"  IQR / Range    : {st['iqr']:.4g} / {st['range']:.4g} {unit}")
             else:
                 lines.append("  (no value left after filtering)")
             for f in g.files:
@@ -719,7 +779,9 @@ class LOMDepthAnalyserPanel(ctk.CTkFrame):
             lines.append(f"  Values         : {st['n']}")
             lines.append(f"  Min / Max      : {st['min']:.4g} / {st['max']:.4g} {unit}")
             lines.append(f"  Mean / Median  : {st['mean']:.4g} / {st['median']:.4g} {unit}")
-            lines.append(f"  Std dev (n-1)  : {st['std']:.4g} {unit}")
+            lines.append(f"  Std dev (n-1)  : {st['std']:.4g} {unit}  (CV {st['cv']:.3g} %)")
+            lines.append(f"  Mean 95% CI    : {st['mean'] - st['ci95']:.4g} … "
+                         f"{st['mean'] + st['ci95']:.4g} {unit}")
         return "\n".join(lines)
 
     def _refresh_stats(self):
