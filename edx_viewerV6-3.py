@@ -6,6 +6,9 @@ EDX Line Scan Viewer  –  v6.2 (English Lab Edition + Visual Zones & PDF Report
 • ADDED: Phase names displayed floating *above* the graph (no overlapping with curves or titles).
 • ADDED: Comprehensive PDF Report Generator (Graph + Parameters + Zone Data Table).
 • PRESERVED: Save graph as Image (PNG/SVG/PDF), export data as CSV and Excel (.xlsx).
+• ADDED (v6.3): "LOM Depth Analyser" window (add-on modules lom_depth_analyser.py /
+  lom_depth_core.py) - depth distribution & statistics from LOM measurement CSV files.
+  All the original functions are left untouched.
 """
 
 import customtkinter as ctk
@@ -20,6 +23,13 @@ import matplotlib.ticker as ticker
 from matplotlib.widgets import SpanSelector
 import os
 import json
+
+# ── Add-on module: "LOM Depth Analyser" (separate window, optional) ──────────
+try:
+    from lom_depth_analyser import LOMDepthAnalyserWindow
+    _LOM_IMPORT_ERROR = None
+except Exception as _lom_exc:          # missing file or missing dependency
+    LOMDepthAnalyserWindow, _LOM_IMPORT_ERROR = None, _lom_exc
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -282,6 +292,13 @@ class EDXApp(ctk.CTk):
         ctk.CTkButton(p, text="⚙ Phase Editor (JSON)", fg_color="#009E73", hover_color="#007755", command=self._open_phase_editor).pack(fill="x", pady=2)
         ctk.CTkButton(p, text="📋 Identify Multi-Zones", fg_color="#56B4E9", text_color="black", hover_color="#3399CC", command=self._generate_phase_report).pack(fill="x", pady=2)
         ctk.CTkButton(p, text="❌ Clear Zones Overlay", fg_color="gray40", hover_color="gray30", command=self._clear_zones).pack(fill="x", pady=2)
+
+        self._section(p, "LOM DEPTH ANALYSIS")
+        ctk.CTkButton(p, text="📏 LOM Depth Analyser", fg_color="#CC79A7", hover_color="#A65C86",
+                      text_color="black", command=self._open_lom_depth_analyser).pack(fill="x", pady=2)
+        ctk.CTkLabel(p, text="Depth distribution & statistics from LOM CSV files",
+                     font=("Helvetica", 10), text_color="gray", wraplength=240,
+                     justify="left").pack(anchor="w")
 
         self._section(p, "ELEMENTS")
         self.el_frame = ctk.CTkFrame(p, fg_color="transparent")
@@ -624,6 +641,23 @@ class EDXApp(ctk.CTk):
                     self.df_raw.to_excel(w, sheet_name="Raw", index=False)
                 messagebox.showinfo("Success", "Data exported to Excel.")
             except Exception as e: messagebox.showerror("Error", str(e))
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    #  LOM Depth Analyser (independent add-on window)
+    # ─────────────────────────────────────────────────────────────────────────────
+    def _open_lom_depth_analyser(self):
+        """Open the 'LOM Depth Analyser' window (depth distribution from LOM CSV files)."""
+        if LOMDepthAnalyserWindow is None:
+            messagebox.showerror(
+                "Module not available",
+                "The files 'lom_depth_analyser.py' and 'lom_depth_core.py' must be placed "
+                "next to this program.\n\nImport error:\n" + str(_LOM_IMPORT_ERROR))
+            return
+        win = getattr(self, "_lom_window", None)
+        if win is not None and win.winfo_exists():
+            win.deiconify(); win.lift(); win.focus()
+            return
+        self._lom_window = LOMDepthAnalyserWindow(self)
 
     # ─────────────────────────────────────────────────────────────────────────────
     #  Tracé de la Figure et Événements Matplotlib
