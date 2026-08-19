@@ -1,18 +1,20 @@
 """
 Image Zone Analyser  --  "Image Zone Analyser" module of the analysis suite
 -------------------------------------------------------------------------
-Finds the zones of an optical micrograph by COLOUR and by PROXIMITY, then
-measures them:
+Splits a micrograph of a polished cross-section into as many ZONES as needed,
+each defined by its colour and given a ROLE (reference material, zone to
+measure, background, ignored), then measures:
 
-  * the oxide / corrosion layer growing along the edges of the section is
-    detected as the class of pixels touching the sound metal,
-  * its thickness is measured perpendicular to the axis of the section - from
-    the first sound-metal pixel out to the end of the oxide - column after
-    column, giving hundreds of measurements and a thickness profile,
-  * the area of every detected object is reported in real units.
+  * the thickness of the layer growing along the edges of the reference,
+    perpendicular to the section, column after column,
+  * the thickness of each measured zone inside that layer (stratigraphy),
+  * the area of every zone and of every object,
+  * the porosity of the reference material, its own thickness, the share of
+    the edge actually attacked and the deepest penetration.
 
-The thicknesses can be pushed straight into the LOM Depth Analyser module,
-which already draws their distribution and computes the statistics.
+Zones come either from sampling the picture by hand or from an automatic
+colour clustering restricted to the interface band. Thicknesses can be pushed
+into the LOM Depth Analyser module, which draws their distribution.
 
 The UI is a plain CTkFrame so it can fill a tab of the suite; the maths lives
 in image_zones_core.py and is tested without a screen.
@@ -32,7 +34,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 
-from .constants import BACKGROUND_PRESETS, ACCENT
+from .constants import COLORS_DEFAULT, BACKGROUND_PRESETS, ACCENT
 from .color_utils import contrast_text_color
 from .legend_utils import apply_legend, fit_layout
 from .widgets import ColorPickerDialog, add_tooltip
@@ -42,10 +44,8 @@ from . import image_zones_core as core
 
 VIEW_MODES = ["Overlay", "Original image", "Thickness profile"]
 SIDE_CHOICES = {"Both edges": ("top", "bottom"), "Top edge": ("top",), "Bottom edge": ("bottom",)}
-ROLES = ["metal", "zone", "background"]
-ROLE_LABELS = {"metal": "Sound metal (reference)", "zone": "Zone to measure",
-               "background": "Background (ignored)"}
-MIN_RELIABLE_PX = 5.0          # below that, a thickness is only a few pixels wide
+RESOLUTIONS = {"1:2 (recommended)": 2, "1:1 (full, slow)": 1, "1:4 (fast preview)": 4}
+MIN_RELIABLE_PX = 5.0          # below that a thickness is only a few pixels wide
 
 
 class ImageZoneAnalyserPanel(ctk.CTkFrame):
@@ -58,15 +58,16 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
 
         # ---- data ------------------------------------------------------
         self.image_path = None
-        self.rgb = None
-        self.lab = None
+        self.image = None                    # uint8 RGB, full resolution
+        self.preview = None                  # decimated copy used for display
+        self.preview_factor = 1
         self.result = None
-        self.scale = None                    # real units per pixel
+        self.comparison = None
+        self.scale = None                    # real units per pixel, full resolution
         self.scale_unit = "µm"
         self.calibration_arrow = None
-        self.classes = [{"name": n, "color": c, "role": r, "samples": [],
-                         "stats": None, "auto": False}
-                        for n, c, r in core.DEFAULT_CLASSES]
+        self.zones = [{"name": n, "color": c, "role": r, "samples": [], "stats": None,
+                       "auto": False} for n, c, r in core.DEFAULT_ZONES]
 
         # ---- interaction ----------------------------------------------
         self._tool = None                    # None | "calibrate" | ("sample", idx)
@@ -74,15 +75,24 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
         self._temp_artist = None
 
         # ---- settings --------------------------------------------------
+        self.resolution_var = tk.StringVar(value=list(RESOLUTIONS)[0])
+        self.auto_k_var = tk.StringVar(value="6")
+        self.band_var = tk.StringVar(value="150")           # real units, each side
+        self.layer_mode_var = tk.StringVar(value=list(core.LAYER_MODES)[0])
+        self.chroma_var = tk.StringVar(value=f"{core.DEFAULT_CHROMA:g}")
+        self.smooth_var = tk.StringVar(value="1")
         self.closing_var = tk.StringVar(value="1")
         self.min_area_var = tk.StringVar(value="20")        # real units squared
         self.max_distance_var = tk.StringVar(value="300")   # real units
-        self.reject_var = tk.StringVar(value="")            # Lab distance, empty = off
+        self.attack_var = tk.StringVar(value="0")           # real units
         self.side_var = tk.StringVar(value="Both edges")
         self.step_var = tk.StringVar(value="1")
         self.gap_var = tk.StringVar(value="3")
         self.keep_empty = ctk.BooleanVar(value=False)
         self.straighten = ctk.BooleanVar(value=True)
+        self.stratigraphy = ctk.BooleanVar(value=True)
+        self.want_porosity = ctk.BooleanVar(value=True)
+        self.want_specimen = ctk.BooleanVar(value=True)
 
         # ---- display ---------------------------------------------------
         self.view_var = tk.StringVar(value=VIEW_MODES[0])
@@ -96,7 +106,7 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
         self.image_name_var = tk.StringVar(value="No image loaded")
 
         self._build_ui()
-        self._refresh_classes()
+        self._refresh_zones()
         self._refresh_results()
         self._render()
 
@@ -116,7 +126,7 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        self.left_panel = ctk.CTkScrollableFrame(self, width=330, corner_radius=0)
+        self.left_panel = ctk.CTkScrollableFrame(self, width=340, corner_radius=0)
         self.left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
 
         center = ctk.CTkFrame(self, fg_color="transparent")
@@ -124,7 +134,7 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
         canvas_frame = ctk.CTkFrame(center)
         canvas_frame.pack(fill="both", expand=True)
 
-        self.right_panel = ctk.CTkScrollableFrame(self, width=370, corner_radius=0)
+        self.right_panel = ctk.CTkScrollableFrame(self, width=380, corner_radius=0)
         self.right_panel.grid(row=0, column=2, sticky="nsew", padx=(5, 0))
 
         self._build_left(self.left_panel)
@@ -144,14 +154,20 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
     def _build_left(self, p):
         ctk.CTkLabel(p, text="Image Zone Analyser",
                      font=("Helvetica", 20, "bold")).pack(anchor="w", pady=(5, 2))
-        ctk.CTkLabel(p, text="Oxide / corrosion thickness and area from a micrograph",
-                     font=("Helvetica", 11), text_color="gray", wraplength=300,
+        ctk.CTkLabel(p, text="Zones by colour and proximity: thickness, stratigraphy, areas",
+                     font=("Helvetica", 11), text_color="gray", wraplength=310,
                      justify="left").pack(anchor="w")
 
         self._section(p, "IMAGE")
         ctk.CTkButton(p, text="🖼 Load micrograph", command=self._load_image).pack(fill="x", pady=2)
         ctk.CTkLabel(p, textvariable=self.image_name_var, font=("Helvetica", 11),
-                     text_color="gray", wraplength=300, justify="left").pack(anchor="w")
+                     text_color="gray", wraplength=310, justify="left").pack(anchor="w")
+        ctk.CTkLabel(p, text="Analysis resolution :").pack(anchor="w", pady=(6, 0))
+        res = ctk.CTkComboBox(p, variable=self.resolution_var, values=list(RESOLUTIONS))
+        res.pack(fill="x", pady=2)
+        add_tooltip(res, "These micrographs reach 90 Mpx. 1:2 keeps ~1 µm/px\n"
+                         "and runs in seconds; 1:1 is four times slower and\n"
+                         "needs several GB of memory.")
 
         self._section(p, "SCALE CALIBRATION")
         cal_btn = ctk.CTkButton(p, text="📏 Set scale (draw arrow)", fg_color="#E69F00",
@@ -161,61 +177,91 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
         det_btn = ctk.CTkButton(p, text="🔍 Detect the scale bar", fg_color="gray35",
                                 command=self._detect_scale_bar)
         det_btn.pack(fill="x", pady=2)
-        add_tooltip(det_btn, "Look for the bright scale bar in the bottom-right corner\nand ask for the length it stands for.")
+        add_tooltip(det_btn, "Finds the thin straight bright bar of the bottom-right\ncorner and asks what length it stands for.")
         ctk.CTkLabel(p, textvariable=self.scale_status, text_color=ACCENT,
-                     font=("Arial", 11, "bold"), wraplength=300, justify="left").pack(anchor="w", pady=(4, 0))
+                     font=("Arial", 11, "bold"), wraplength=310, justify="left").pack(anchor="w", pady=(4, 0))
 
-        self._section(p, "COLOUR CLASSES")
-        ctk.CTkLabel(p, text="Sample a few spots of each class on the image, "
-                             "or start from the automatic split.",
-                     text_color="gray", font=("Arial", 10), wraplength=300,
+        self._section(p, "ZONES")
+        ctk.CTkLabel(p, text="Sample each material on the image, then say what to do "
+                             "with it. Add as many zones as the picture has materials.",
+                     text_color="gray", font=("Arial", 10), wraplength=310,
                      justify="left").pack(anchor="w")
-        auto_btn = ctk.CTkButton(p, text="⚡ Automatic split (colour clustering)", fg_color="gray35",
-                                 command=self._auto_classes)
-        auto_btn.pack(fill="x", pady=4)
-        add_tooltip(auto_btn, "Cluster the colours of the picture in three groups:\n"
-                              "brightest = metal, the coloured dark one = oxide,\n"
-                              "the neutral dark one = resin. Sampling a class by hand\n"
-                              "afterwards replaces its automatic seed.")
-        self.classes_frame = ctk.CTkFrame(p, fg_color="transparent")
-        self.classes_frame.pack(fill="x", pady=2)
+        row = ctk.CTkFrame(p, fg_color="transparent")
+        row.pack(fill="x", pady=4)
+        auto_btn = ctk.CTkButton(row, text="⚡ Auto", width=90, fg_color="gray35",
+                                 command=self._auto_zones)
+        auto_btn.pack(side="left", padx=(0, 4))
+        add_tooltip(auto_btn, "Cluster the colours of the interface band and propose\n"
+                              "one zone per material, with a role for each.\n"
+                              "Restricting it to the band matters: on the whole picture\n"
+                              "the clusters are eaten by the specimen.")
+        ctk.CTkLabel(row, text="k :").pack(side="left")
+        ctk.CTkEntry(row, textvariable=self.auto_k_var, width=40).pack(side="left", padx=(2, 8))
+        ctk.CTkButton(row, text="＋ Add zone", width=110,
+                      command=self._add_zone).pack(side="right")
+        self._entry_row(p, "Interface band (± ) :", self.band_var,
+                        "Half-width of the ribbon around the boundary of the\n"
+                        "reference the automatic clustering learns from.")
+        self.zones_frame = ctk.CTkFrame(p, fg_color="transparent")
+        self.zones_frame.pack(fill="x", pady=2)
+
+        self._section(p, "LAYER DEFINITION")
+        mode = ctk.CTkComboBox(p, variable=self.layer_mode_var, values=list(core.LAYER_MODES))
+        mode.pack(fill="x", pady=2)
+        add_tooltip(mode, "What counts in the thickness:\n"
+                          "• the zones you marked 'measure'\n"
+                          "• everything between the reference and the background\n"
+                          "• only the coloured (iridescent) pixels")
+        self._entry_row(p, "Chroma threshold :", self.chroma_var,
+                        "Used by the 'chromatic only' definition.\n"
+                        "12 separates an iridescent film from a neutral grey.")
+        ctk.CTkButton(p, text="⚖ Compare the three definitions", fg_color="gray35",
+                      command=self._compare_modes).pack(fill="x", pady=4)
 
         self._section(p, "SEGMENTATION")
+        self._entry_row(p, "Pre-smoothing (px) :", self.smooth_var,
+                        "Median filter applied before classification.\n0 disables it.")
         self._entry_row(p, "Smoothing radius (px) :", self.closing_var,
                         "Closes the small holes and jagged edges of the masks.")
         self._entry_row(p, "Min. object area :", self.min_area_var,
-                        "Objects smaller than this (in squared real units) are dropped.")
-        self._entry_row(p, "Max. distance to metal :", self.max_distance_var,
-                        "A zone is corrosion only if it lies within this distance\nof the sound metal. This is what rejects dark specks in the resin.")
-        self._entry_row(p, "Colour tolerance :", self.reject_var,
-                        "Optional. Pixels further than this normalised Lab distance\nfrom every class are left unclassified.")
+                        "Objects smaller than this (squared real units) are dropped.")
+        self._entry_row(p, "Max. distance to reference :", self.max_distance_var,
+                        "A zone counts as a layer only within this distance of the\n"
+                        "reference. This is what rejects specks lying further away.")
 
-        self._section(p, "THICKNESS MEASUREMENT")
+        self._section(p, "MEASUREMENT")
         ctk.CTkLabel(p, text="Edge measured :").pack(anchor="w")
-        ctk.CTkComboBox(p, variable=self.side_var, values=list(SIDE_CHOICES.keys())).pack(fill="x", pady=2)
+        ctk.CTkComboBox(p, variable=self.side_var, values=list(SIDE_CHOICES)).pack(fill="x", pady=2)
         self._entry_row(p, "Column step (px) :", self.step_var,
                         "1 = one measurement per pixel column.")
         self._entry_row(p, "Gap tolerance (px) :", self.gap_var,
-                        "How many non-zone pixels may interrupt the layer\nbefore the scan stops.")
-        ctk.CTkCheckBox(p, text="Count columns without oxide as 0",
-                        variable=self.keep_empty).pack(anchor="w", pady=3)
+                        "How many pixels of something else may interrupt the layer\nbefore the scan stops.")
+        self._entry_row(p, "Attacked above :", self.attack_var,
+                        "A column counts as attacked above this thickness.\n"
+                        "Use it to ignore the thin mounting gap of an intact edge.")
+        ctk.CTkCheckBox(p, text="Count columns without layer as 0",
+                        variable=self.keep_empty).pack(anchor="w", pady=2)
         ctk.CTkCheckBox(p, text="Straighten the section before measuring",
-                        variable=self.straighten).pack(anchor="w", pady=3)
+                        variable=self.straighten).pack(anchor="w", pady=2)
+        ctk.CTkCheckBox(p, text="Thickness of each zone (stratigraphy)",
+                        variable=self.stratigraphy).pack(anchor="w", pady=2)
+        ctk.CTkCheckBox(p, text="Porosity of the reference",
+                        variable=self.want_porosity).pack(anchor="w", pady=2)
+        ctk.CTkCheckBox(p, text="Thickness of the reference itself",
+                        variable=self.want_specimen).pack(anchor="w", pady=2)
 
-        run_btn = ctk.CTkButton(p, text="▶ Analyse", fg_color="#009E73", hover_color="#007755",
-                                height=36, font=("Helvetica", 13, "bold"), command=self._run_analysis)
-        run_btn.pack(fill="x", pady=(12, 15))
+        ctk.CTkButton(p, text="▶ Analyse", fg_color="#009E73", hover_color="#007755",
+                      height=36, font=("Helvetica", 13, "bold"),
+                      command=self._run_analysis).pack(fill="x", pady=(12, 15))
 
     def _build_canvas(self, frame):
         self.fig = Figure(figsize=(8.5, 6), facecolor=self.fig_bg_color.get())
         self.ax = self.fig.add_subplot(111)
         self.canvas = FigureCanvasTkAgg(self.fig, master=frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
         tb = ctk.CTkFrame(frame, fg_color="transparent")
         tb.pack(fill="x")
         NavigationToolbar2Tk(self.canvas, tb).update()
-
         self.canvas.mpl_connect("button_press_event", self._on_press)
         self.canvas.mpl_connect("motion_notify_event", self._on_motion)
         self.canvas.mpl_connect("button_release_event", self._on_release)
@@ -223,7 +269,7 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
 
     def _build_right(self, p):
         self._section(p, "RESULTS")
-        self.results_box = ctk.CTkTextbox(p, height=360, font=("Consolas", 11), wrap="none")
+        self.results_box = ctk.CTkTextbox(p, height=420, font=("Consolas", 11), wrap="none")
         self.results_box.pack(fill="both", expand=True, pady=5)
 
         self._section(p, "DISPLAY")
@@ -248,99 +294,148 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
                       command=self._export_excel).pack(fill="x", pady=2)
         ctk.CTkButton(p, text="📑 Generate PDF report", fg_color="#882255",
                       hover_color="#551133", command=self._export_pdf).pack(fill="x", pady=2)
-        send_btn = ctk.CTkButton(p, text="➡ Send thicknesses to LOM Depth Analyser",
-                                 fg_color="#0072B2", hover_color="#005588",
-                                 command=self._send_thicknesses)
-        send_btn.pack(fill="x", pady=(10, 15))
-        add_tooltip(send_btn, "Create a group in the LOM Depth Analyser tab holding\nevery thickness measured here, for the distribution and statistics.")
+        send = ctk.CTkButton(p, text="➡ Send thicknesses to LOM Depth Analyser",
+                             fg_color="#0072B2", hover_color="#005588",
+                             command=self._send_thicknesses)
+        send.pack(fill="x", pady=(10, 15))
+        add_tooltip(send, "Create a group in the LOM Depth Analyser tab holding every\n"
+                          "thickness measured here, for the distribution and statistics.")
 
     def _on_alpha(self, value):
         self.alpha_label.configure(text=f"{float(value):.2f}")
         self._render()
 
     # ─────────────────────────────────────────────────────────────────────
-    #  Classes
+    #  Zones
     # ─────────────────────────────────────────────────────────────────────
-    def _refresh_classes(self):
-        for w in self.classes_frame.winfo_children():
+    def _refresh_zones(self):
+        for w in self.zones_frame.winfo_children():
             w.destroy()
-        for idx, cl in enumerate(self.classes):
-            card = ctk.CTkFrame(self.classes_frame, corner_radius=6)
+        if not self.zones:
+            ctk.CTkLabel(self.zones_frame, text="No zone yet.", text_color="gray",
+                         font=("Arial", 11)).pack(anchor="w", pady=4)
+            return
+        for idx, zone in enumerate(self.zones):
+            card = ctk.CTkFrame(self.zones_frame, corner_radius=6)
             card.pack(fill="x", pady=4)
 
             head = ctk.CTkFrame(card, fg_color="transparent")
             head.pack(fill="x", padx=6, pady=(6, 2))
-            btn = ctk.CTkButton(head, text="", width=22, height=22, fg_color=cl["color"])
-            btn.configure(command=lambda i=idx, b=btn: self._pick_class_color(i, b))
+            btn = ctk.CTkButton(head, text="", width=22, height=22, fg_color=zone["color"])
+            btn.configure(command=lambda i=idx, b=btn: self._pick_zone_color(i, b))
             btn.pack(side="left", padx=(0, 6))
-            entry = ctk.CTkEntry(head, width=140)
-            entry.insert(0, cl["name"])
+            entry = ctk.CTkEntry(head, width=130)
+            entry.insert(0, zone["name"])
             entry.pack(side="left", fill="x", expand=True)
-            entry.bind("<FocusOut>", lambda _e, i=idx, en=entry: self._rename_class(i, en))
-            entry.bind("<Return>", lambda _e, i=idx, en=entry: self._rename_class(i, en))
+            entry.bind("<FocusOut>", lambda _e, i=idx, en=entry: self._rename_zone(i, en))
+            entry.bind("<Return>", lambda _e, i=idx, en=entry: self._rename_zone(i, en))
+            ctk.CTkButton(head, text="✕", width=26, fg_color="gray35", hover_color="#7a2222",
+                          command=lambda i=idx: self._remove_zone(i)).pack(side="right")
 
-            ctk.CTkLabel(card, text=ROLE_LABELS.get(cl["role"], cl["role"]),
-                         font=("Arial", 10), text_color="gray", anchor="w").pack(fill="x", padx=10)
+            role = tk.StringVar(value=core.ROLE_LABELS[zone["role"]])
+            ctk.CTkComboBox(card, variable=role, values=list(core.ROLE_LABELS.values()),
+                            height=26, command=lambda v, i=idx: self._set_role(i, v)
+                            ).pack(fill="x", padx=8, pady=2)
 
-            if cl.get("auto") and cl["stats"]:
-                info = f"automatic split · {cl['stats']['n']} px"
+            if zone.get("auto") and zone["stats"]:
+                info = f"automatic · {zone['stats']['n']} px"
             else:
-                n_px = sum(len(sample) for sample in cl["samples"])
-                info = f"{len(cl['samples'])} sample(s) · {n_px} px"
-            ctk.CTkLabel(card, text=info, font=("Arial", 10),
-                         text_color="#9aa0a6", anchor="w").pack(fill="x", padx=10)
+                n_px = sum(len(s) for s in zone["samples"])
+                info = f"{len(zone['samples'])} sample(s) · {n_px} px"
+            ctk.CTkLabel(card, text=info, font=("Arial", 10), text_color="#9aa0a6",
+                         anchor="w").pack(fill="x", padx=10)
 
             actions = ctk.CTkFrame(card, fg_color="transparent")
             actions.pack(fill="x", padx=8, pady=6)
             ctk.CTkButton(actions, text="🖉 Sample", height=24, fg_color="gray30",
-                          command=lambda i=idx: self._activate_sampling(i)).pack(side="left", expand=True, padx=(0, 4))
-            ctk.CTkButton(actions, text="✕", width=32, height=24, fg_color="gray35",
-                          hover_color="#7a2222",
+                          command=lambda i=idx: self._activate_sampling(i)
+                          ).pack(side="left", expand=True, padx=(0, 4))
+            ctk.CTkButton(actions, text="✕ samples", width=76, height=24, fg_color="gray35",
                           command=lambda i=idx: self._clear_samples(i)).pack(side="right")
 
-    def _pick_class_color(self, idx, button):
-        col = ColorPickerDialog.ask_color(self.winfo_toplevel(), initial_color=self.classes[idx]["color"],
-                                          title=f"Colour of '{self.classes[idx]['name']}'")
+    def _set_role(self, idx, label):
+        for role, text in core.ROLE_LABELS.items():
+            if text == label:
+                self.zones[idx]["role"] = role
+                break
+
+    def _add_zone(self):
+        colour = COLORS_DEFAULT[len(self.zones) % len(COLORS_DEFAULT)]
+        name = simpledialog.askstring("New zone", "Name of the zone :",
+                                      initialvalue=f"Zone {len(self.zones) + 1}", parent=self)
+        if name is None:
+            return
+        self.zones.append({"name": name.strip() or f"Zone {len(self.zones) + 1}",
+                           "color": colour, "role": core.ROLE_MEASURE,
+                           "samples": [], "stats": None, "auto": False})
+        self._refresh_zones()
+
+    def _remove_zone(self, idx):
+        if 0 <= idx < len(self.zones):
+            self.zones.pop(idx)
+            self._refresh_zones()
+
+    def _pick_zone_color(self, idx, button):
+        col = ColorPickerDialog.ask_color(self.winfo_toplevel(), initial_color=self.zones[idx]["color"],
+                                          title=f"Colour of '{self.zones[idx]['name']}'")
         if col:
-            self.classes[idx]["color"] = col
+            self.zones[idx]["color"] = col
             button.configure(fg_color=col)
             self._render()
 
-    def _rename_class(self, idx, entry):
+    def _rename_zone(self, idx, entry):
         try:
             new = entry.get().strip()
         except Exception:                                  # noqa: BLE001 - widget gone
             return
-        if new and new != self.classes[idx]["name"]:
-            self.classes[idx]["name"] = new
-            self.after(60, self._refresh_classes)
+        if new and new != self.zones[idx]["name"]:
+            self.zones[idx]["name"] = new
+            self.after(60, self._refresh_zones)
 
     def _clear_samples(self, idx):
-        self.classes[idx].update({"samples": [], "stats": None, "auto": False})
-        self._refresh_classes()
+        self.zones[idx].update({"samples": [], "stats": None, "auto": False})
+        self._refresh_zones()
 
     def _activate_sampling(self, idx):
-        if self.rgb is None:
+        if self.image is None:
             messagebox.showwarning("No image", "Load a micrograph first.", parent=self)
             return
         self._tool = ("sample", idx)
-        self._status(f"Sampling '{self.classes[idx]['name']}': drag a small box over that material.")
+        self._status(f"Sampling '{self.zones[idx]['name']}': drag a small box over that material.")
 
-    def _auto_classes(self):
-        """Seed the three classes without any click, by clustering the colours."""
-        if self.rgb is None:
+    def _auto_zones(self):
+        """Cluster the colours of the interface band into zones with roles."""
+        if self.image is None:
             messagebox.showwarning("No image", "Load a micrograph first.", parent=self)
             return
+        if not core.IMAGING_AVAILABLE:
+            messagebox.showerror("Missing packages", str(core.IMAGING_ERROR), parent=self)
+            return
         try:
-            stats, _centroids = core.auto_class_stats(self.lab)
-            for cl, st in zip(self.classes, stats):
-                cl.update({"stats": st, "samples": [], "auto": True})
-            self._refresh_classes()
-            self._render()
-            self._status("Automatic split done (colour clustering) — "
-                         "sample a few spots to refine it if needed.")
+            self._status("Clustering the colours of the interface band…")
+            self.update_idletasks()
+            rgb = core.to_rgb_float(self.preview)
+            px = (self.scale or 1.0) * self.preview_factor
+            reference = core.largest_component(core.to_gray(rgb) > 0.6, fill_holes=True)
+            band = None
+            half = parse_number(self.band_var.get())
+            if reference.any() and half:
+                band = core.interface_band(reference, half_width_px=float(half) / px)
+            k = int(parse_number(self.auto_k_var.get()) or 6)
+            stats, centroids, roles = core.auto_zone_stats(rgb, k=k, region_mask=band)
         except Exception as exc:                           # noqa: BLE001
-            messagebox.showerror("Automatic split failed", str(exc), parent=self)
+            messagebox.showerror("Automatic zoning failed", str(exc), parent=self)
+            return
+
+        self.zones = []
+        for i, (centroid, role, st) in enumerate(zip(centroids, roles, stats)):
+            self.zones.append({
+                "name": f"Zone {i + 1} (L={centroid[0]:.0f})",
+                "color": COLORS_DEFAULT[i % len(COLORS_DEFAULT)],
+                "role": role, "samples": [], "stats": st, "auto": True})
+        self._refresh_zones()
+        self._status(f"{len(self.zones)} zones proposed — check their roles, "
+                     "or sample a zone by hand to refine it.")
 
     # ─────────────────────────────────────────────────────────────────────
     #  Image & calibration
@@ -355,46 +450,60 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
         if not path:
             return
         try:
-            self.rgb = core.to_rgb_float(mpimg.imread(path))
-            self.lab = core.to_lab(self.rgb)
+            image = mpimg.imread(path)
+            if image.dtype != np.uint8:
+                image = (np.clip(core.to_rgb_float(image), 0, 1) * 255).astype(np.uint8)
+            elif image.ndim == 3 and image.shape[2] > 3:
+                image = image[:, :, :3]
         except Exception as exc:                           # noqa: BLE001
             messagebox.showerror("Error", f"Could not read the image:\n{exc}", parent=self)
             return
+        self.image = image
+        h, w = image.shape[:2]
+        # the display copy never exceeds ~4 Mpx, whatever the file holds
+        self.preview_factor = max(1, int(np.ceil(np.sqrt((h * w) / 4.0e6))))
+        self.preview = core.decimate(image, self.preview_factor)
         self.image_path = path
-        self.result = None
+        self.result = self.comparison = None
         self.calibration_arrow = None
         self.scale = None
         self.scale_status.set("Not calibrated.")
-        for cl in self.classes:
-            cl.update({"samples": [], "stats": None, "auto": False})
-        h, w = self.rgb.shape[:2]
-        self.image_name_var.set(f"{os.path.basename(path)}  ({w} × {h} px)")
-        self._refresh_classes()
+        for zone in self.zones:
+            zone.update({"samples": [], "stats": None, "auto": False})
+        self.image_name_var.set(f"{os.path.basename(path)}  ({w} × {h} px, "
+                                f"{w * h / 1e6:.0f} Mpx — preview 1:{self.preview_factor})")
+        self._refresh_zones()
         self._refresh_results()
         self._render(reset_view=True)
         self._status(f"Micrograph loaded: {os.path.basename(path)}")
 
     def _activate_calibration(self):
-        if self.rgb is None:
+        if self.image is None:
             messagebox.showwarning("No image", "Load a micrograph first.", parent=self)
             return
         self._tool = "calibrate"
         self._status("Calibration: drag an arrow over the scale bar.")
 
     def _detect_scale_bar(self):
-        if self.rgb is None:
+        if self.image is None:
             messagebox.showwarning("No image", "Load a micrograph first.", parent=self)
             return
-        found = core.detect_scale_bar(self.rgb)
+        self._status("Looking for the scale bar…")
+        self.update_idletasks()
+        found = core.detect_scale_bar(self.image)
         if not found:
             messagebox.showinfo("Scale bar", "No scale bar found in the bottom-right corner.\n"
                                              "Use 'Set scale (draw arrow)' instead.", parent=self)
             return
         length_px, p1, p2 = found
+        f = self.preview_factor
+        shown = ((p1[0] / f, p1[1] / f), (p2[0] / f, p2[1] / f))
         CalibrationDialog(self.winfo_toplevel(), length_px,
-                          on_confirm=lambda real, unit: self._apply_calibration(p1, p2, length_px, real, unit))
+                          on_confirm=lambda real, unit: self._apply_calibration(
+                              shown[0], shown[1], length_px, real, unit))
 
     def _apply_calibration(self, p1, p2, pixel_len, real_len, unit):
+        """`pixel_len` is expressed in pixels of the full-resolution picture."""
         self.scale = float(real_len) / float(pixel_len)
         self.scale_unit = unit
         self.calibration_arrow = {"p1": p1, "p2": p2, "real_length": real_len}
@@ -449,31 +558,32 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
             if pixel_len < 2:
                 self.canvas.draw_idle()
                 return
-            CalibrationDialog(self.winfo_toplevel(), pixel_len,
-                              on_confirm=lambda real, unit: self._apply_calibration(p1, p2, pixel_len, real, unit))
+            # the arrow is drawn on the preview: convert to full-resolution pixels
+            CalibrationDialog(self.winfo_toplevel(), pixel_len * self.preview_factor,
+                              on_confirm=lambda real, unit: self._apply_calibration(
+                                  p1, p2, pixel_len * self.preview_factor, real, unit))
         elif isinstance(tool, tuple) and tool[0] == "sample":
             self._collect_sample(tool[1], p1, p2)
         else:
             self.canvas.draw_idle()
 
     def _collect_sample(self, idx, p1, p2):
-        h, w = self.rgb.shape[:2]
+        h, w = self.preview.shape[:2]
         c0, c1 = sorted((int(round(p1[0])), int(round(p2[0]))))
         r0, r1 = sorted((int(round(p1[1])), int(round(p2[1]))))
         c0, c1 = max(0, c0), min(w, max(c1, c0 + 1))
         r0, r1 = max(0, r0), min(h, max(r1, r0 + 1))
-        pixels = self.lab[r0:r1, c0:c1].reshape(-1, 3)
+        pixels = core.to_lab(self.preview[r0:r1, c0:c1]).reshape(-1, 3)
         if pixels.size == 0:
             return
-        cl = self.classes[idx]
-        if cl.get("auto"):              # a hand-picked sample replaces the automatic seed
-            cl.update({"samples": [], "auto": False})
-        cl["samples"].append(pixels)
-        cl["stats"] = core.sample_stats(np.concatenate(cl["samples"]))
-        self._refresh_classes()
-        self._status(f"'{cl['name']}': {len(pixels)} pixels sampled "
-                     f"({sum(len(s) for s in cl['samples'])} in total).")
-        self._render()
+        zone = self.zones[idx]
+        if zone.get("auto"):            # a hand-picked sample replaces the automatic seed
+            zone.update({"samples": [], "auto": False})
+        zone["samples"].append(pixels)
+        zone["stats"] = core.sample_stats(np.concatenate(zone["samples"]))
+        self._refresh_zones()
+        self._status(f"'{zone['name']}': {len(pixels)} pixels sampled "
+                     f"({sum(len(s) for s in zone['samples'])} in total).")
 
     def _on_scroll(self, event):
         if event.inaxes is None or self.view_var.get() == "Thickness profile":
@@ -492,76 +602,98 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
         value = parse_number(var.get())
         return default if value is None else float(value)
 
-    def _run_analysis(self):
-        if self.rgb is None:
+    def _settings(self):
+        return {
+            "reject_distance": None,
+            "closing_radius": int(self._number(self.closing_var, 1)),
+            "min_area": self._number(self.min_area_var, 0),
+            "max_distance": self._number(self.max_distance_var, 0),
+            "layer_mode": core.LAYER_MODES.get(self.layer_mode_var.get(), "selected"),
+            "chroma_threshold": self._number(self.chroma_var, core.DEFAULT_CHROMA),
+            "straighten": bool(self.straighten.get()),
+            "sides": SIDE_CHOICES.get(self.side_var.get(), core.SIDES),
+            "step_px": int(self._number(self.step_var, 1)),
+            "gap_tolerance_px": int(self._number(self.gap_var, 3)),
+            "keep_empty": bool(self.keep_empty.get()),
+            "attack_threshold": self._number(self.attack_var, 0),
+            "stratigraphy": bool(self.stratigraphy.get()),
+            "porosity": bool(self.want_porosity.get()),
+            "specimen_thickness": bool(self.want_specimen.get()),
+            "min_pore_area": self._number(self.min_area_var, 0),
+        }
+
+    def _ready(self):
+        if self.image is None:
             messagebox.showwarning("No image", "Load a micrograph first.", parent=self)
-            return
+            return False
         if not core.IMAGING_AVAILABLE:
             messagebox.showerror("Missing packages", str(core.IMAGING_ERROR), parent=self)
-            return
+            return False
         if self.scale is None:
             messagebox.showwarning("Not calibrated",
                                    "Set the scale first, otherwise the measurements have no unit.",
                                    parent=self)
-            return
-        missing = [c["name"] for c in self.classes if c["role"] in ("metal", "zone") and not c["stats"]]
-        if missing:
-            messagebox.showwarning("Classes not defined",
-                                   "Sample these classes on the image first:\n• " + "\n• ".join(missing)
-                                   + "\n\n(or use the automatic split)", parent=self)
-            return
+            return False
+        roles = [z["role"] for z in self.zones if z["stats"]]
+        if core.ROLE_REFERENCE not in roles:
+            messagebox.showwarning("No reference",
+                                   "One sampled zone must carry the 'Reference' role: it is "
+                                   "where the thicknesses are measured from.", parent=self)
+            return False
+        return True
 
-        px_area = self.scale * self.scale
+    def _sampled_zones(self):
+        return [z for z in self.zones if z["stats"]]
+
+    def _run_analysis(self):
+        if not self._ready():
+            return
+        factor = RESOLUTIONS.get(self.resolution_var.get(), 2)
         try:
-            self._status("Analysing…")
+            self._status(f"Analysing at 1:{factor}…")
             self.update_idletasks()
-            self.result = core.analyse(
-                self.rgb,
-                [c["stats"] for c in self.classes],
-                [c["role"] for c in self.classes],
-                scale=self.scale,
-                reject_distance=parse_number(self.reject_var.get()),
-                closing_radius=int(self._number(self.closing_var, 1)),
-                min_area_px=int(self._number(self.min_area_var, 0) / px_area),
-                max_distance_px=self._number(self.max_distance_var, 0) / self.scale,
-                straighten=bool(self.straighten.get()),
-                sides=SIDE_CHOICES.get(self.side_var.get(), core.SIDES),
-                step_px=int(self._number(self.step_var, 1)),
-                gap_tolerance_px=int(self._number(self.gap_var, 3)),
-                keep_empty=bool(self.keep_empty.get()))
+            self.result = core.analyse(self.image, self._sampled_zones(), self.scale,
+                                       factor=factor,
+                                       smooth_radius=int(self._number(self.smooth_var, 0)),
+                                       **self._settings())
+            self.comparison = None
         except Exception as exc:                           # noqa: BLE001
             messagebox.showerror("Analysis failed", str(exc), parent=self)
             self._status("Analysis failed.")
             return
-
-        n = self.result["stats"]["n"]
-        self.view_var.set("Overlay" if n else self.view_var.get())
         self._refresh_results()
-        self._render()
-        self._status(f"Analysis done: {n} thickness measurement(s), "
-                     f"mean {self.result['stats']['mean']:.3g} {self.scale_unit}.")
+        self._render(reset_view=True)
+        st = self.result["stats"]
+        self._status(f"Analysis done: {st['n']} thickness measurement(s), "
+                     f"mean {st['mean']:.4g} {self.scale_unit}.")
 
-    def _masks_for_display(self):
-        if not self.result:
-            return {}, {}
-        masks, colors = {}, {}
-        for cl in self.classes:
-            if cl["role"] == "background":
-                continue
-            mask = self.result.get(cl["role"])
-            if mask is not None and np.any(mask):
-                masks[cl["name"]] = mask
-                colors[cl["name"]] = cl["color"]
-        return masks, colors
+    def _compare_modes(self):
+        if not self._ready():
+            return
+        factor = RESOLUTIONS.get(self.resolution_var.get(), 2)
+        settings = self._settings()
+        settings.pop("layer_mode")
+        for key in ("porosity", "specimen_thickness", "stratigraphy"):
+            settings.pop(key, None)
+        try:
+            self._status("Comparing the three layer definitions…")
+            self.update_idletasks()
+            self.comparison = core.compare_modes(self.image, self._sampled_zones(),
+                                                 self.scale, factor=factor, **settings)
+        except Exception as exc:                           # noqa: BLE001
+            messagebox.showerror("Comparison failed", str(exc), parent=self)
+            return
+        self._refresh_results()
+        self._status("Comparison done — see the results panel.")
 
     # ─────────────────────────────────────────────────────────────────────
     #  Rendering
     # ─────────────────────────────────────────────────────────────────────
-    def _style_axes(self, light=False):
-        face = "white" if light else self.plot_bg_color.get()
-        self.fig.patch.set_facecolor("white" if light else self.fig_bg_color.get())
-        self.ax.set_facecolor(face)
-        return face, ("black" if light else contrast_text_color(face))
+    def _display_image(self):
+        """The picture shown, and the factor between it and the analysis grid."""
+        if self.result is not None:
+            return self.result["image"], self.result["factor"]
+        return self.preview, self.preview_factor
 
     def _render(self, reset_view=False, ax=None, fig=None, light=False):
         target_ax = ax if ax is not None else self.ax
@@ -573,38 +705,41 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
             xlim, ylim = target_ax.get_xlim(), target_ax.get_ylim()
 
         target_ax.clear()
-        if embedded:
-            face, text_color = self._style_axes(light)
-        else:
-            face = "white" if light else self.plot_bg_color.get()
-            text_color = "black" if light else contrast_text_color(face)
-            target_fig.patch.set_facecolor("white" if light else self.fig_bg_color.get())
-            target_ax.set_facecolor(face)
+        face = "white" if light else self.plot_bg_color.get()
+        text_color = "black" if light else contrast_text_color(face)
+        target_fig.patch.set_facecolor("white" if light else self.fig_bg_color.get())
+        target_ax.set_facecolor(face)
 
-        view = self.view_var.get()
-        if view == "Thickness profile":
+        if self.view_var.get() == "Thickness profile":
             self._render_profile(target_ax, target_fig, face, text_color)
             return
 
         target_ax.axis("off")
-        if self.rgb is None:
+        if self.image is None:
             target_ax.text(0.5, 0.5, "Load a micrograph to begin", ha="center", va="center",
-                           transform=target_ax.transAxes, color="gray", fontsize=self.font_size.get() + 2)
+                           transform=target_ax.transAxes, color="gray",
+                           fontsize=self.font_size.get() + 2)
             target_fig.tight_layout()
             if embedded:
                 self.canvas.draw()
             return
 
-        picture = self.rgb
-        masks, colors = self._masks_for_display()
-        if view == "Overlay" and masks:
-            picture = core.build_overlay(self.rgb, masks, colors,
+        picture, factor = self._display_image()
+        masks, colors = {}, {}
+        if self.view_var.get() == "Overlay" and self.result:
+            for name, mask in self.result["zone_masks"].items():
+                if np.any(mask):
+                    masks[name] = mask
+                    colors[name] = next((z["color"] for z in self.zones if z["name"] == name), "#FFFFFF")
+            picture = core.build_overlay(picture, masks, colors,
                                          alpha=float(self.overlay_alpha.get()),
                                          outline=bool(self.show_outlines.get()))
         target_ax.imshow(picture)
 
         if self.calibration_arrow:
-            p1, p2 = self.calibration_arrow["p1"], self.calibration_arrow["p2"]
+            ratio = self.preview_factor / max(1, factor)
+            p1 = (self.calibration_arrow["p1"][0] * ratio, self.calibration_arrow["p1"][1] * ratio)
+            p2 = (self.calibration_arrow["p2"][0] * ratio, self.calibration_arrow["p2"][1] * ratio)
             target_ax.annotate("", xy=p2, xytext=p1,
                                arrowprops=dict(arrowstyle="<->", color="#E69F00", linewidth=2))
             target_ax.text((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2,
@@ -613,10 +748,26 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
                            ha="center", va="bottom",
                            bbox=dict(facecolor="black", alpha=0.6, edgecolor="none"))
 
-        if view == "Overlay" and masks:
+        deepest = (self.result or {}).get("max_penetration")
+        if deepest and self.view_var.get() == "Overlay":
+            column = deepest["column"]
+            rows = np.flatnonzero(self.result["reference"][:, min(column, self.result["reference"].shape[1] - 1)]) \
+                if column < self.result["reference"].shape[1] else np.array([])
+            if rows.size:
+                y = rows[0] if deepest["side"] == "top" else rows[-1]
+                depth = deepest["thickness"] / self.result["scale"]
+                y2 = y - depth if deepest["side"] == "top" else y + depth
+                target_ax.annotate("", xy=(column, y2), xytext=(column, y),
+                                   arrowprops=dict(arrowstyle="<->", color="#FF0000", linewidth=2))
+                target_ax.text(column, (y + y2) / 2, f"  max {deepest['thickness']:.4g} {self.scale_unit}",
+                               color="#FF0000", fontsize=self.font_size.get(), fontweight="bold",
+                               ha="left", va="center",
+                               bbox=dict(facecolor="black", alpha=0.6, edgecolor="none"))
+
+        if masks:
             handles = [Rectangle((0, 0), 1, 1, facecolor=colors[name], edgecolor="none")
                        for name in masks]
-            target_ax.legend(handles, list(masks.keys()), loc="upper right",
+            target_ax.legend(handles, list(masks), loc="upper right",
                              fontsize=self.font_size.get(), framealpha=0.8)
 
         if xlim is not None:
@@ -628,8 +779,8 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
 
     def _render_profile(self, ax, fig, face, text_color):
         fs = self.font_size.get()
-        # imshow leaves the axes with an equal aspect and a top-down y axis,
-        # and ax.clear() keeps both: undo them or the curve is squashed flat
+        # imshow leaves an equal aspect and a top-down y axis behind, and
+        # ax.clear() keeps both: undo them or the curve is squashed flat
         ax.set_aspect("auto")
         ax.axis("on")
         if ax.yaxis_inverted():
@@ -650,8 +801,8 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
 
         profile = self.result["profile"] if self.result else None
         if profile is None or not len(profile):
-            ax.text(0.5, 0.5, "Run the analysis to get a thickness profile",
-                    ha="center", va="center", transform=ax.transAxes, color="gray", fontsize=fs + 2)
+            ax.text(0.5, 0.5, "Run the analysis to get a thickness profile", ha="center",
+                    va="center", transform=ax.transAxes, color="gray", fontsize=fs + 2)
         else:
             for side, color in (("top", "#56B4E9"), ("bottom", "#E69F00")):
                 part = profile[profile["Side"] == side]
@@ -670,56 +821,82 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
     # ─────────────────────────────────────────────────────────────────────
     def _results_text(self):
         unit = self.scale_unit
-        lines = ["IMAGE", f"  File          : {os.path.basename(self.image_path) if self.image_path else '-'}"]
-        if self.rgb is not None:
-            h, w = self.rgb.shape[:2]
-            lines.append(f"  Size          : {w} x {h} px")
-        lines.append(f"  Scale         : " + (f"{self.scale:.4g} {unit}/px" if self.scale else "not calibrated"))
-        lines.append("")
+        lines = ["IMAGE",
+                 f"  File          : {os.path.basename(self.image_path) if self.image_path else '-'}"]
+        if self.image is not None:
+            h, w = self.image.shape[:2]
+            lines.append(f"  Size          : {w} x {h} px ({w * h / 1e6:.0f} Mpx)")
+        lines.append("  Scale         : " + (f"{self.scale:.4g} {unit}/px" if self.scale else "not calibrated"))
+
+        if self.comparison is not None and len(self.comparison):
+            lines += ["", "LAYER DEFINITIONS COMPARED", self.comparison.round(3).to_string(index=False)]
 
         if not self.result:
-            lines.append("Sample the classes, then press 'Analyse'.")
+            lines += ["", "Sample the zones, give them a role, then press 'Analyse'."]
             return "\n".join(lines)
 
-        st = self.result["stats"]
-        lines.append("THICKNESS OF THE MEASURED ZONE")
-        lines.append(f"  Section tilt  : {self.result['angle']:+.2f} deg (corrected)")
-        lines.append(f"  Measurements  : {st['n']}")
+        res, st = self.result, self.result["stats"]
+        lines += ["", "THICKNESS OF THE LAYER",
+                  f"  Analysed at   : 1:{res['factor']}  ({res['scale']:.4g} {unit}/px)",
+                  f"  Definition    : {self.layer_mode_var.get()}",
+                  f"  Section tilt  : {res['angle']:+.2f} deg (corrected)",
+                  f"  Measurements  : {st['n']}"]
         if st["n"]:
-            lines.append(f"  Min / Max     : {st['min']:.4g} / {st['max']:.4g} {unit}")
-            lines.append(f"  Mean          : {st['mean']:.4g} {unit}")
-            lines.append(f"  Median        : {st['median']:.4g} {unit}")
-            lines.append(f"  Std dev (n-1) : {st['std']:.4g} {unit}")
-            lines.append(f"  P10 / P90     : {st['p10']:.4g} / {st['p90']:.4g} {unit}")
-            profile = self.result["profile"]
+            lines += [f"  Min / Max     : {st['min']:.4g} / {st['max']:.4g} {unit}",
+                      f"  Mean          : {st['mean']:.4g} {unit}",
+                      f"  Median        : {st['median']:.4g} {unit}",
+                      f"  Std dev (n-1) : {st['std']:.4g} {unit}",
+                      f"  P10 / P90     : {st['p10']:.4g} / {st['p90']:.4g} {unit}"]
+            profile = res["profile"]
             for side in ("top", "bottom"):
                 part = profile[profile["Side"] == side]
                 if len(part):
-                    lines.append(f"  {side:<6} edge   : n={len(part)}  mean={part['Thickness'].mean():.4g}  "
-                                 f"max={part['Thickness'].max():.4g} {unit}")
-            mean_px = st["mean"] / self.scale if self.scale else 0
-            lines.append("")
+                    lines.append(f"  {side:<6} edge   : n={len(part)}  mean={part['Thickness'].mean():.4g}"
+                                 f"  max={part['Thickness'].max():.4g} {unit}")
+            mean_px = st["mean"] / res["scale"]
             lines.append(f"  Resolution    : mean thickness = {mean_px:.1f} px")
             if mean_px < MIN_RELIABLE_PX:
-                lines.append("  /!\\ WARNING: fewer than 5 pixels. At this magnification the")
-                lines.append("      measurement is dominated by the pixel size — use a more")
-                lines.append("      magnified picture for a layer this thin.")
-        lines.append("")
+                lines += ["  /!\\ fewer than 5 pixels: the measurement is dominated by",
+                          "      the pixel size — analyse at a finer resolution."]
 
-        lines.append("AREAS")
-        for _, row in self.result["summary"].iterrows():
-            lines.append(f"  {row['Class']}")
-            lines.append(f"     objects    : {int(row['Objects'])}")
-            lines.append(f"     area       : {row['Area']:.6g} {unit}^2")
-            if np.isfinite(row["Share of specimen (%)"]):
-                lines.append(f"     share      : {row['Share of specimen (%)']:.2f} % of the specimen")
-        objects = self.result["objects"]
-        if len(objects):
-            lines.append("")
-            lines.append(f"  Largest objects ({min(5, len(objects))} of {len(objects)}):")
-            for _, row in objects.nlargest(5, "Area").iterrows():
-                lines.append(f"     #{int(row['Object']):<4} area={row['Area']:.5g} {unit}^2  "
-                             f"length={row['Length']:.4g} {unit}")
+        if res.get("zone_names") and len(res["profile"]):
+            lines += ["", "STRATIGRAPHY (mean thickness of each zone)"]
+            for name in res["zone_names"]:
+                if name in res["profile"].columns:
+                    column = res["profile"][name]
+                    lines.append(f"  {name[:26]:<26} : mean {column.mean():.4g}  max {column.max():.4g} {unit}")
+
+        if len(res["attack"]):
+            lines += ["", f"ATTACK COVERAGE (above {self._number(self.attack_var, 0):g} {unit})"]
+            for _, row in res["attack"].iterrows():
+                lines.append(f"  {row['Side']:<6} : {row['Attacked (%)']:5.1f} % of the edge, "
+                             f"{row['Attacked length']:.4g} {unit} in total")
+
+        deepest = res.get("max_penetration")
+        if deepest:
+            lines += ["", "DEEPEST PENETRATION",
+                      f"  {deepest['thickness']:.4g} {unit} on the {deepest['side']} edge, "
+                      f"at {deepest['position']:.4g} {unit} along the section"]
+
+        if res.get("porosity_percent") is not None and np.isfinite(res.get("porosity_percent", np.nan)):
+            lines += ["", "POROSITY OF THE REFERENCE",
+                      f"  Pores         : {len(res['pore_table'])}",
+                      f"  Porosity      : {res['porosity_percent']:.2f} % of its area"]
+            if len(res["pore_table"]):
+                area = res["pore_table"]["Area"]
+                lines.append(f"  Pore area     : mean {area.mean():.4g}, max {area.max():.4g} {unit}^2")
+
+        if res.get("specimen") is not None and len(res["specimen"]):
+            thick = res["specimen"]["Specimen thickness"]
+            lines += ["", "THICKNESS OF THE REFERENCE ITSELF",
+                      f"  Mean / Median    : {thick.mean():.4g} / {thick.median():.4g} {unit}",
+                      f"  Min / Max        : {thick.min():.4g} / {thick.max():.4g} {unit}",
+                      "  (the extreme columns hold only a few pixels: read the median)"]
+
+        lines += ["", "AREAS"]
+        for _, row in res["summary"].iterrows():
+            lines.append(f"  {row['Zone'][:26]:<26} : {row['Area']:.6g} {unit}^2  "
+                         f"({int(row['Objects'])} objects)")
         return "\n".join(lines)
 
     def _refresh_results(self):
@@ -737,36 +914,41 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
         return True
 
     def _export_frames(self):
-        unit = self.scale_unit
-        summary = self.result["summary"].rename(columns={"Area": f"Area ({unit}^2)"})
-        profile = self.result["profile"].rename(columns={
-            "Position": f"Position ({unit})", "Thickness": f"Thickness ({unit})"})
-        objects = self.result["objects"].rename(columns={
-            "Area": f"Area ({unit}^2)", "Perimeter": f"Perimeter ({unit})",
-            "Equivalent diameter": f"Equivalent diameter ({unit})",
-            "Length": f"Length ({unit})", "Width": f"Width ({unit})",
-            "Centroid X": f"Centroid X ({unit})", "Centroid Y": f"Centroid Y ({unit})"})
-        st = self.result["stats"]
-        stats = pd.DataFrame([{"Statistic": k, f"Value ({unit})": v} for k, v in st.items()])
-        return summary, stats, profile, objects
+        unit, res = self.scale_unit, self.result
+        summary = res["summary"].rename(columns={"Area": f"Area ({unit}^2)"})
+        profile = res["profile"].rename(columns={"Position": f"Position ({unit})",
+                                                 "Thickness": f"Thickness ({unit})"})
+        stats = pd.DataFrame([{"Statistic": k, f"Value ({unit})": v} for k, v in res["stats"].items()])
+        frames = {"Areas": summary, "Statistics": stats, "Thickness profile": profile,
+                  "Attack coverage": res["attack"],
+                  "Objects": res["objects"].rename(columns={"Area": f"Area ({unit}^2)"})}
+        if res.get("specimen") is not None:
+            frames["Specimen profile"] = res["specimen"]
+        if res.get("pore_table") is not None and len(res["pore_table"]):
+            frames["Pores"] = res["pore_table"].rename(columns={"Area": f"Area ({unit}^2)"})
+        if self.comparison is not None and len(self.comparison):
+            frames["Definitions compared"] = self.comparison
+        return frames
 
     def _header_lines(self):
-        st = self.result["stats"]
+        res, st = self.result, self.result["stats"]
         return [
             "Image Zone Analyser export",
             f"Image: {os.path.basename(self.image_path) if self.image_path else '-'}",
-            f"Scale: {self.scale:.6g} {self.scale_unit}/px",
-            f"Section tilt corrected: {self.result['angle']:+.3f} deg",
+            f"Scale: {self.scale:.6g} {self.scale_unit}/px (analysed at 1:{res['factor']}"
+            f" = {res['scale']:.6g} {self.scale_unit}/px)",
+            f"Layer definition: {self.layer_mode_var.get()}",
+            f"Zones: " + "; ".join(f"{z['name']} [{z['role']}]" for z in self._sampled_zones()),
+            f"Section tilt corrected: {res['angle']:+.3f} deg",
             f"Edge measured: {self.side_var.get()}",
-            f"Column step: {self.step_var.get()} px",
-            f"Gap tolerance: {self.gap_var.get()} px",
-            f"Max distance to metal: {self.max_distance_var.get()} {self.scale_unit}",
+            f"Column step: {self.step_var.get()} px, gap tolerance: {self.gap_var.get()} px",
+            f"Max distance to reference: {self.max_distance_var.get()} {self.scale_unit}",
             f"Min object area: {self.min_area_var.get()} {self.scale_unit}^2",
             f"Measurements: {st['n']}",
         ]
 
     def _export_image(self):
-        if self.rgb is None:
+        if self.image is None:
             messagebox.showwarning("No image", "Load a micrograph first.", parent=self)
             return
         path = filedialog.asksaveasfilename(
@@ -788,14 +970,12 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
                                             filetypes=[("CSV", "*.csv")])
         if not path:
             return
-        summary, stats, profile, objects = self._export_frames()
         try:
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 for line in self._header_lines():
                     f.write(f"# {line}\n")
-                for title, df in (("AREAS", summary), ("THICKNESS STATISTICS", stats),
-                                  ("THICKNESS PROFILE", profile), ("OBJECTS", objects)):
-                    f.write(f"\n# --- {title} ---\n")
+                for title, df in self._export_frames().items():
+                    f.write(f"\n# --- {title.upper()} ---\n")
                     if len(df):
                         df.round(6).to_csv(f, sep=";", index=False, decimal=",", lineterminator="\n")
                     else:
@@ -812,16 +992,13 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
                                             filetypes=[("Excel", "*.xlsx")])
         if not path:
             return
-        summary, stats, profile, objects = self._export_frames()
         try:
             with pd.ExcelWriter(path, engine="openpyxl") as writer:
                 pd.DataFrame({"Parameter": self._header_lines()}).to_excel(
                     writer, sheet_name="Parameters", index=False)
-                summary.to_excel(writer, sheet_name="Areas", index=False)
-                stats.to_excel(writer, sheet_name="Statistics", index=False)
-                profile.to_excel(writer, sheet_name="Thickness profile", index=False)
-                if len(objects):
-                    objects.to_excel(writer, sheet_name="Objects", index=False)
+                for title, df in self._export_frames().items():
+                    if len(df):
+                        df.to_excel(writer, sheet_name=title[:31], index=False)
             self._status(f"Measurements exported: {os.path.basename(path)}")
             messagebox.showinfo("Success", f"Data exported:\n{path}", parent=self)
         except Exception as exc:                           # noqa: BLE001
@@ -844,7 +1021,7 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
             with PdfPages(path) as pdf:
                 for chunk in chunks:
                     page = Figure(figsize=(8.5, 11), facecolor="white")
-                    page.text(0.07, 0.96, "\n".join(chunk), fontsize=9, va="top",
+                    page.text(0.05, 0.96, "\n".join(chunk), fontsize=8, va="top",
                               ha="left", fontfamily="monospace")
                     pdf.savefig(page)
                 for view in ("Overlay", "Thickness profile"):
@@ -873,10 +1050,10 @@ class ImageZoneAnalyserPanel(ctk.CTkFrame):
                                       initialvalue=default, parent=self)
         if name is None:
             return
-        name = name.strip() or default
         if not callable(self._send_to_lom):
             messagebox.showerror("Not available",
-                                 "The LOM Depth Analyser module is not reachable from here.", parent=self)
+                                 "The LOM Depth Analyser module is not reachable from here.",
+                                 parent=self)
             return
-        self._send_to_lom(name, values, self.scale_unit)
-        self._status(f"{values.size} thickness(es) sent to the LOM Depth Analyser as '{name}'.")
+        self._send_to_lom(name.strip() or default, values, self.scale_unit)
+        self._status(f"{values.size} thickness(es) sent to the LOM Depth Analyser.")
